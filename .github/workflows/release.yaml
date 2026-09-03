@@ -159,7 +159,8 @@ jobs:
           cp share.rb "$(brew --repo local/test)/Formula/share.rb"
           brew install --formula local/test/share
           brew test local/test/share
-          share 2>&1 | grep -q "send folders/files to friends"
+          # dispatcher exits 1 when printing help — don't let pipefail eat it
+          (share 2>&1 || true) | grep -q "send folders/files to friends"
 
   tap-push:
     needs: [prepare, validate-runtime]
