@@ -8,7 +8,7 @@ npx @dhruv-hhai/share                                                           
 curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash  # or plain
 ```
 
-Each brings [croc](https://github.com/schollz/croc) along (npm/curl: via croc's installer if missing). Then: `share tutorial`.
+brew and curl bring [croc](https://github.com/schollz/croc) along; npm needs it installed already. Then: `share tutorial`.
 
 A file exchange needs a single secret exchange — nothing more, nothing less.
 

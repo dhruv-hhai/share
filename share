@@ -3,6 +3,7 @@
 # Requires: croc (https://github.com/schollz/croc)
 # a command is an executable in tools/; `share <cmd> --help` prints its header.
 set -euo pipefail
+command -v croc >/dev/null || { echo "share: needs croc — brew install croc  |  curl https://getcroc.com | bash" >&2; exit 1; }
 T="$(dirname "$(readlink -f "$0")")/tools"; export PATH="$T:$PATH"
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 if [ ! -f "$T/$cmd" ]; then
