@@ -14,10 +14,7 @@ A file exchange needs a single secret exchange — nothing more, nothing less.
 
 Say you want to keep sharing a folder or file with a friend, without a persistent connection between your machines.
 
-1. **Generate a secret** and send it over something you trust (Signal, in person):
-   ```sh
-   openssl rand -base64 18 | tr -dc 'a-zA-Z0-9'
-   ```
+1. **Pick a secret** — three random words is plenty (`share push` suggests one) — and send it over something you trust (Signal, in person).
 2. **Register each other.** You name them, they name you, same secret:
    ```sh
    echo 'export SHARE_SECRET_SUNNY="<secret>"' >> ~/.zshrc && source ~/.zshrc   # you
