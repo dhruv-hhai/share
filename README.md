@@ -3,10 +3,12 @@
 Send folders/files to friends using [croc](https://github.com/schollz/croc).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash
+brew install dhruv-hhai/tap/share                                                  # macOS / Linux
+npx @dhruv-hhai/share                                                              # or via npm
+curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash  # or plain
 ```
 
-Installs [croc](https://github.com/schollz/croc) if missing, clones this repo to `~/.share`, links `share` into `~/.local/bin`. Then: `share tutorial`.
+Each brings [croc](https://github.com/schollz/croc) along (npm/curl: via croc's installer if missing). Then: `share tutorial`.
 
 A file exchange needs a single secret exchange — nothing more, nothing less.
 
