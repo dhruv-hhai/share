@@ -30,7 +30,7 @@ code="$(grep -oE 'accept [^ ]+ [a-z-]+' "$S/invite.out" | awk '{print $3}')"
 note "...on their machine, they run it:"
 run env HOME="$S/them" share friends accept alice "$code"
 wait "$P" 2>/dev/null || true; P=""
-export SHARE_SECRET_BOB="$(sed -n 's/^export SHARE_SECRET_BOB="\(.*\)"$/\1/p' "$HOME/.zshrc")"
+SHARE_SECRET_BOB="$(sed -n 's/^export SHARE_SECRET_BOB="\(.*\)"$/\1/p' "$HOME/.zshrc")"; export SHARE_SECRET_BOB
 run share friends
 
 say "3/5 — The code is derived, never sent"

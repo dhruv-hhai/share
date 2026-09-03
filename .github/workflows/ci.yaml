@@ -1,0 +1,115 @@
+# Sanity validations for a repo of small bash tools.
+#
+# Patterns imported from hive-kube's CI (see release.yaml header for the
+# release-side imports): actions pinned to commit SHAs, minimal permissions,
+# concurrency cancellation, workflow_call so the release pipeline reuses
+# these gates verbatim.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: v1.7.8
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: shellcheck
+        run: |
+          command -v shellcheck || sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning share install tools/*
+
+      - name: actionlint
+        run: |
+          curl -sL "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz" | tar xz actionlint
+          ./actionlint -color
+
+  # Hermetic end-to-end: a croc relay on localhost, a friend secret in env,
+  # push → pull → verify. No public relay, no network beyond installing croc.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install croc
+        run: curl -fsSL https://getcroc.com | bash
+
+      - name: Start local relay
+        run: |
+          croc relay --ports 9009,9010 >/tmp/relay.log 2>&1 &
+          for _ in $(seq 1 50); do nc -z localhost 9009 && break; sleep 0.2; done
+          nc -z localhost 9009 || { cat /tmp/relay.log; exit 1; }
+
+      - name: Round trip — push, pull (SHARE_PULL_DIR), verify
+        env:
+          CROC_RELAY: localhost:9009
+          SHARE_SECRET_SELF: ci-test-secret-1
+        run: |
+          set -euo pipefail
+          # code derivation is deterministic
+          [ "$(./share code --friend self)" = "$(./share code --friend self)" ]
+
+          mkdir -p /tmp/src && echo "round trip $(date -u)" > /tmp/src/hi.txt
+          ./share push --friend self /tmp/src > /tmp/push.log 2>&1 &
+          sleep 3
+          SHARE_PULL_DIR=/tmp/base timeout 60 ./share pull --friend self > /tmp/pull.log 2>&1
+          wait
+          diff /tmp/src/hi.txt /tmp/base/self/src/hi.txt
+          # the gates printed
+          grep -q '\[1/3\] code for self' /tmp/push.log
+          grep -q 'rotates at UTC midnight' /tmp/push.log
+
+      - name: Round trip — --dest overrides SHARE_PULL_DIR
+        env:
+          CROC_RELAY: localhost:9009
+          SHARE_SECRET_SELF: ci-test-secret-1
+        run: |
+          set -euo pipefail
+          ./share push --friend self /tmp/src/hi.txt >/dev/null 2>&1 &
+          sleep 3
+          SHARE_PULL_DIR=/tmp/ignored timeout 60 ./share pull --friend self --dest /tmp/explicit >/dev/null 2>&1
+          wait
+          test -f /tmp/explicit/hi.txt && test ! -d /tmp/ignored
+
+      - name: Regression — interrupted invite leaves no secret droppings in cwd
+        env:
+          CROC_RELAY: localhost:9009
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"; sandbox="$(mktemp -d)"
+          cd "$work"
+          HOME="$sandbox" SHELL=/bin/bash "$GITHUB_WORKSPACE/share" friends invite testx > invite.out 2>&1 &
+          IP=$!
+          for _ in $(seq 1 50); do grep -q accept invite.out && break; sleep 0.2; done
+          grep -q accept invite.out || { cat invite.out; exit 1; }
+          kill "$IP" 2>/dev/null; sleep 1
+          droppings=$(find . -name 'croc-stdin-*' | wc -l)
+          [ "$droppings" -eq 0 ] || { echo "::error::croc-stdin droppings left in cwd"; exit 1; }
+
+      - name: Dispatcher contract — help lists every tool, each tool has a header
+        run: |
+          set -euo pipefail
+          help_out="$(./share 2>&1 || true)"
+          for t in tools/*; do
+            name="$(basename "$t")"
+            echo "$help_out" | grep -q "share $name" || { echo "::error::$name missing from dispatcher help"; exit 1; }
+            ./share "$name" --help | grep -qi usage || { echo "::error::$name --help has no usage line"; exit 1; }
+          done

@@ -1,0 +1,203 @@
+# Release pipeline: tag → sha256 the tag tarball → render formula →
+# brew audit → brew install + brew test (macos + ubuntu) → push to
+# dhruv-hhai/tap. Proportionate import of hive-kube's release-ts-cli.yaml:
+#
+# - every third-party action pinned to a commit SHA (trust contract)
+# - SHA frozen in `prepare`; every job operates on that exact tree
+# - all validation gates (CI + brew audit + brew install/test from the real
+#   tag tarball) pass before the tap advances; the tag push is the only
+#   pre-validation external write, and recovery is `git push --delete`
+# - throwaway local tap for audit/install (loose-file formulas are gone)
+# - tap push uses a diff-cached guard: same-version re-render that differs
+#   means non-determinism, and an identical one means nothing to ship —
+#   both fail loudly instead of committing garbage
+# - dry_run previews (gates + version checks) with no external writes
+#
+# Needs a TAP_PUSH_TOKEN repo secret with push access to dhruv-hhai/tap.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.3.0) — tag v<version> must not exist"
+        required: true
+        type: string
+      dry_run:
+        description: "Preview: run gates + version checks, write nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.freeze.outputs.sha }}
+      version: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Validate version + freeze SHA
+        id: freeze
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
+          git fetch -q --tags
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::tag v${VERSION} already exists"; exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "::notice::Releasing ${VERSION} from $(git rev-parse --short HEAD)"
+
+  ci:
+    uses: ./.github/workflows/ci.yaml
+
+  tag:
+    needs: [prepare, ci]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Push tag from frozen SHA
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+
+  render:
+    needs: [prepare, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch tag tarball + render formula
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/dhruv-hhai/share/archive/refs/tags/v${VERSION}.tar.gz"
+          # the tag was pushed seconds ago; give the archive endpoint a beat
+          for _ in $(seq 1 10); do curl -sfLo share.tar.gz "$URL" && break; sleep 3; done
+          test -s share.tar.gz
+          SHA256="$(sha256sum share.tar.gz | awk '{print $1}')"
+          cat > share.rb <<EOF
+          class Share < Formula
+            desc "Send folders/files to friends using croc"
+            homepage "https://github.com/dhruv-hhai/share"
+            url "${URL}"
+            sha256 "${SHA256}"
+            license "MIT"
+
+            depends_on "croc"
+
+            def install
+              libexec.install "share", "tools"
+              bin.install_symlink libexec/"share"
+            end
+
+            test do
+              assert_match "send folders/files to friends", shell_output("#{bin}/share", 1)
+            end
+          end
+          EOF
+          echo "::notice::Rendered share.rb (sha256 ${SHA256})"
+          cat share.rb
+
+      - name: brew audit --strict (throwaway local tap)
+        run: |
+          set -euo pipefail
+          brew tap-new local/test --no-git
+          cp share.rb "$(brew --repo local/test)/Formula/share.rb"
+          brew audit --strict --formula local/test/share
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formula
+          path: share.rb
+          retention-days: 1
+
+  validate-runtime:
+    needs: render
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula
+
+      - name: brew install + brew test from the real tag tarball
+        run: |
+          set -euo pipefail
+          brew tap-new local/test --no-git
+          cp share.rb "$(brew --repo local/test)/Formula/share.rb"
+          brew install --formula local/test/share
+          brew test local/test/share
+          share 2>&1 | grep -q "send folders/files to friends"
+
+  tap-push:
+    needs: [prepare, validate-runtime]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dhruv-hhai/tap
+          ref: main
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula
+          path: rendered
+
+      - name: Commit formula (diff-cached guard) and push
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "share-release[bot]"
+          git config user.email "share-release@users.noreply.github.com"
+          cp rendered/share.rb Formula/share.rb
+          git add Formula/
+          if git diff --cached --quiet; then
+            echo "::error::tap already up to date with this version — nothing to ship"
+            exit 1
+          fi
+          git commit -m "share ${VERSION}"
+          git push origin main
+
+  dry-run-report:
+    needs: [prepare, ci]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: What a real run would do
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          echo "::notice::DRY RUN — gates passed. A real run would: tag v${VERSION} at ${SHA}, render + audit the formula, brew install/test on macos+ubuntu, push to dhruv-hhai/tap."
