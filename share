@@ -5,6 +5,9 @@
 set -euo pipefail
 command -v croc >/dev/null || { echo "share: needs croc — brew install croc  |  curl https://getcroc.com | bash" >&2; exit 1; }
 T="$(dirname "$(readlink -f "$0")")/tools"; export PATH="$T:$PATH"
+# once a day, if installed via brew: nudge when outdated
+case "$T" in */Cellar/*) st="${TMPDIR:-/tmp}/share-upd"; [ -n "$(find "$st" -mtime -1 2>/dev/null)" ] || { touch "$st"
+  [ -z "$(brew outdated --quiet share 2>/dev/null)" ] || echo "share: update available — brew upgrade share" >&2; };; esac
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 if [ ! -f "$T/$cmd" ]; then
   sed -n '2,3p' "$0" | sed 's/^# //'; echo
