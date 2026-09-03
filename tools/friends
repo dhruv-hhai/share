@@ -21,7 +21,9 @@ case "${1:-}" in
     # cwd = private tmpdir: croc --text writes the secret to ./croc-stdin-* and
     # only cleans it on success — keep those droppings out of the user's cwd.
     (cd "$tmpd" && exec croc --yes send --text "$s" </dev/null >"$out" 2>&1) & p=$!
-    until c="$(grep -oE 'croc [a-z]+(-[a-z]+)+' "$out" | head -1 | cut -d' ' -f2)" && [ -n "$c" ]; do
+    # the code is the only 3+-word hyphenated token croc prints — match it
+    # directly so custom relays (croc --relay HOST code) don't break parsing
+    until c="$(grep -oE '[a-z0-9]+(-[a-z0-9]+){2,}' "$out" | head -1)" && [ -n "$c" ]; do
       kill -0 "$p" 2>/dev/null || { cat "$out" >&2; exit 1; }; sleep 0.2
     done
     printf 'share: [1/3] room open at the relay — one-time code ready (room holds ~3h)\n' >&2
