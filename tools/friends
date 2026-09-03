@@ -17,8 +17,10 @@ case "${1:-}" in
   invite)
     n="${2:?usage: share friends invite NAME}"; me="$(whoami)"
     s="$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')"
-    out="$(mktemp)"; trap 'rm -f "$out"' EXIT
-    croc --yes send --text "$s" </dev/null >"$out" 2>&1 & p=$!
+    tmpd="$(mktemp -d)"; out="$tmpd/out"; trap 'rm -rf "$tmpd"' EXIT
+    # cwd = private tmpdir: croc --text writes the secret to ./croc-stdin-* and
+    # only cleans it on success — keep those droppings out of the user's cwd.
+    (cd "$tmpd" && exec croc --yes send --text "$s" </dev/null >"$out" 2>&1) & p=$!
     until c="$(grep -oE 'croc [a-z]+(-[a-z]+)+' "$out" | head -1 | cut -d' ' -f2)" && [ -n "$c" ]; do
       kill -0 "$p" 2>/dev/null || { cat "$out" >&2; exit 1; }; sleep 0.2
     done
