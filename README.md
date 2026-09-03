@@ -1,6 +1,8 @@
 # share
 
-Send folders/files to friends using [croc](https://github.com/schollz/croc).
+Send files/folders across machines statelessly using [croc](https://github.com/schollz/croc).
+
+Instant messaging & hosting platforms require personal identification to allow you to upload & share data on their servers. `share` needs neither: no account, no server that knows you, no state left behind — just a one-time code between two people.
 
 ```sh
 brew tap dhruv-hhai/tap && brew install share
