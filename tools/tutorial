@@ -20,11 +20,17 @@ run share friends
 note "Nobody yet. Try anyway — share tells you exactly what to do:"
 run share push --friend bob "$S"
 
-say "2/5 — Add a friend"
-note "One command registers them and prints the line they run to register you."
-export HOME="$S/home" SHELL=/bin/zsh; mkdir -p "$HOME"   # sandboxed rc file
-run share friends add bob paper-otter-sunday
-export SHARE_SECRET_DEMO="paper-otter-sunday"
+say "2/5 — Pair with a friend"
+note "You invite, they accept with a short one-time code. The secret rides croc's PAKE — nobody types it."
+export HOME="$S/home" SHELL=/bin/zsh; mkdir -p "$HOME" "$S/them"   # sandboxed rc files
+read -rp "  [enter to invite] "
+HOME="$S/home" share friends invite bob > "$S/invite.out" 2>&1 & P=$!
+until grep -q accept "$S/invite.out"; do sleep 0.2; done; sed 's/^/  /' "$S/invite.out"
+code="$(grep -oE 'accept [^ ]+ [a-z-]+' "$S/invite.out" | awk '{print $3}')"
+note "…on their machine, they run it:"
+run env HOME="$S/them" share friends accept alice "$code"
+wait "$P" 2>/dev/null || true; P=""
+export SHARE_SECRET_BOB="$(sed -n 's/^export SHARE_SECRET_BOB="\(.*\)"$/\1/p' "$HOME/.zshrc")"
 run share friends
 
 say "3/5 — The code is derived, never sent"

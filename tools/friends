@@ -1,16 +1,34 @@
 #!/usr/bin/env bash
-# desc: who you can share with; add one
-# usage: share friends                 list
-#        share friends add NAME [SECRET]   register NAME (generates SECRET if omitted), prints what they run
+# desc: who you can share with; invite / accept / add
+# usage: share friends                     list
+#        share friends invite NAME         pair with NAME: prints a one-time code to tell them
+#        share friends accept NAME CODE    other side: receive the secret, register NAME
+#        share friends add NAME [SECRET]   register NAME by hand (generates SECRET if omitted)
+# Pairing rides croc's PAKE: the code is short, single-use, and safe to say over any channel.
 set -euo pipefail
 rc="${ZDOTDIR:-$HOME}/.$(basename "${SHELL:-zsh}")rc"
+var() { echo "SHARE_SECRET_$(tr 'a-z-' 'A-Z_' <<<"$1")"; }
 case "${1:-}" in
   add)
     n="${2:?usage: share friends add NAME [SECRET]}"; s="${3:-$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')}"
-    var="SHARE_SECRET_$(tr 'a-z-' 'A-Z_' <<<"$n")"
-    grep -q "^export $var=" "$rc" 2>/dev/null && { echo "share: $n already in $rc — edit it there" >&2; exit 1; }
-    printf 'export %s="%s"\n' "$var" "$s" >> "$rc"
-    printf 'added %s to %s — run:  source %s\n\nsend %s this over something you trust:\n\n  share friends add %s %s\n' \
-      "$n" "$rc" "$rc" "$n" "$(whoami)" "$s";;
+    grep -q "^export $(var "$n")=" "$rc" 2>/dev/null && { echo "share: $n already in $rc — edit it there" >&2; exit 1; }
+    printf 'export %s="%s"\n' "$(var "$n")" "$s" >> "$rc"
+    echo "added $n to $rc — run:  source $rc";;
+  invite)
+    n="${2:?usage: share friends invite NAME}"; me="$(whoami)"
+    s="$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')"
+    out="$(mktemp)"; trap 'rm -f "$out"' EXIT
+    croc --yes send --text "$s" </dev/null >"$out" 2>&1 & p=$!
+    until c="$(grep -oE 'croc [a-z]+(-[a-z]+)+' "$out" | head -1 | cut -d' ' -f2)" && [ -n "$c" ]; do
+      kill -0 "$p" 2>/dev/null || { cat "$out" >&2; exit 1; }; sleep 0.2
+    done
+    printf 'tell %s to run:\n\n  share friends accept %s %s\n\n(waiting for them…)\n' "$n" "$me" "$c"
+    wait "$p"
+    friends add "$n" "$s";;
+  accept)
+    n="${2:?usage: share friends accept NAME CODE}"; c="${3:?usage: share friends accept NAME CODE}"
+    echo "pairing with $n… (Ctrl-C to cancel)" >&2
+    s="$(CROC_SECRET="$c" croc --yes </dev/null 2>/dev/null)"; [ -n "$s" ] || { echo "share: pairing failed (wrong or used code?)" >&2; exit 1; }
+    friends add "$n" "$s";;
   *) env | sed -n 's/^SHARE_SECRET_\([^=]*\)=.*/\1/p' | tr 'A-Z_' 'a-z-';;
 esac
