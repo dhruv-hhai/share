@@ -115,7 +115,7 @@ jobs:
             end
 
             test do
-              assert_match "send folders/files to friends", shell_output("#{bin}/share", 1)
+              assert_match "send folders/files to friends", shell_output(bin/"share", 1)
             end
           end
           EOF
