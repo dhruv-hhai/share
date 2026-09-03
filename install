@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# install — curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash
+set -euo pipefail
+command -v croc >/dev/null || curl -fsSL https://getcroc.com | bash
+[ -d ~/.share ] && git -C ~/.share pull -q || git clone -q https://github.com/dhruv-hhai/share ~/.share
+mkdir -p ~/.local/bin && ln -sf ~/.share/share ~/.local/bin/share
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo 'add to your shell rc:  export PATH="$HOME/.local/bin:$PATH"';; esac
+echo "installed — try:  share tutorial"

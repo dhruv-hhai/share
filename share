@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # share — send folders/files to friends using croc (https://github.com/schollz/croc).
-# Requires: brew install croc
+# Requires: croc (https://github.com/schollz/croc)
 # a command is an executable in tools/; `share <cmd> --help` prints its header.
 set -euo pipefail
 T="$(dirname "$(readlink -f "$0")")/tools"; export PATH="$T:$PATH"

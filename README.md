@@ -3,10 +3,10 @@
 Send folders/files to friends using [croc](https://github.com/schollz/croc).
 
 ```sh
-brew install croc
-git clone https://github.com/dhruv-hhai/share ~/.share && ln -s ~/.share/share ~/.local/bin/share
-share tutorial
+curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash
 ```
+
+Installs [croc](https://github.com/schollz/croc) if missing, clones this repo to `~/.share`, links `share` into `~/.local/bin`. Then: `share tutorial`.
 
 A file exchange needs a single secret exchange — nothing more, nothing less.
 
