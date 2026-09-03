@@ -1,32 +1,44 @@
-# share README demo — real transfer: mac pushes, hetzner box pulls.
+# share README demo — side-by-side: alice (mac) pushes, bob (hetzner) pulls.
+# Reproduce: bash demo-setup.sh is invoked by the hidden block below.
 Output share-demo.gif
 
-Set Shell "zsh"
-Set FontSize 17
-Set Width 1080
-Set Height 640
-Set Padding 16
-Set TypingSpeed 35ms
+Set Shell "bash"
+Set FontSize 15
+Set Width 1320
+Set Height 600
+Set Padding 12
+Set TypingSpeed 40ms
 Set Theme "Catppuccin Mocha"
 
 Hide
-Type `export $(grep -h SHARE_SECRET_ANALAYA ~/.zshrc | sed 's/export //;s/"//g') && cd $(mktemp -d) && mkdir notes && echo 'hello from the mac' > notes/hi.md && clear`
+Type "bash demo-setup.sh && tmux -L demo attach -t demo"
 Enter
-Sleep 1
+Sleep 7
 
 Show
-Type "share friends"
+Sleep 1
+Type "ls notes/"
 Enter
-Sleep 2
+Sleep 2.5
 
-Type "share push --friend analaya ./notes &"
+Type "share push --friend bob ./notes"
 Enter
-Sleep 5
+Sleep 6
 
-Type "ssh analaya share pull --friend mac"
-Enter
-Sleep 14
+# over to bob
+Ctrl+B
+Right
+Sleep 1.5
 
-Type "ssh analaya cat 'share/mac/notes/hi.md'"
+Type "share pull --friend alice"
 Enter
-Sleep 4
+Sleep 12
+
+Type "ls share/alice/notes/"
+Enter
+Sleep 3
+
+# back to alice — push returned
+Ctrl+B
+Left
+Sleep 3
