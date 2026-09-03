@@ -49,6 +49,8 @@ share code --friend NAME           today's code, for debugging
 share tutorial                     guided tour in a sandbox
 ```
 
+Every step prints its gates: today's code (also usable as plain `croc <code>`), how long the relay holds an unclaimed room (~3h), and when the code rotates (UTC midnight — with a warning if that's imminent).
+
 Every command takes `--help`. The brew install checks for updates once a day and nudges `brew upgrade share`.
 
 ## Layout
