@@ -3,7 +3,7 @@
 Send folders/files to friends using [croc](https://github.com/schollz/croc).
 
 ```sh
-brew install dhruv-hhai/tap/share
+brew tap dhruv-hhai/tap && brew install share
 ```
 
 Or without Homebrew: `curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash`.
