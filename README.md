@@ -34,6 +34,21 @@ Alice wants to keep sharing a folder with Bob, without a persistent connection b
 
 That's it. Repeat 3–4 whenever there's something new; Bob's copy gets overwritten.
 
+## Commands
+
+```
+share friends                      who you can share with
+share friends invite NAME          pair: prints a one-time code to tell them
+share friends accept NAME CODE     other side of a pairing
+share friends add NAME [SECRET]    register by hand
+share push --friend NAME PATH...   send (blocks until they pull)
+share pull --friend NAME [--dest]  receive (default ~/share/NAME)
+share code --friend NAME           today's code, for debugging
+share tutorial                     guided tour in a sandbox
+```
+
+Every command takes `--help`. The brew install checks for updates once a day and nudges `brew upgrade share`.
+
 ## Layout
 
 ```
