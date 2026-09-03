@@ -1,42 +1,52 @@
 # share
 
 Send files/folders across machines statelessly using [croc](https://github.com/schollz/croc).
+- Remember friends & assign dedicated sharing folders with them
 
-![share push on one machine, share pull on another — a real transfer with the gates printed](.github/share.gif)
+# Installation & dependencies
 
-Instant messaging & hosting platforms require personal identification to allow you to upload & share data on their servers. `share` needs neither: no account, no server that knows you, no state left behind — just a one-time code between two people.
+Dependency
+- [croc](https://github.com/schollz/croc) 
+- unix shell
 
-```sh
+```sh macos
 brew tap dhruv-hhai/tap && brew install share
 ```
 
-Or without Homebrew: `curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash`.
-Both bring [croc](https://github.com/schollz/croc) along. Then: `share tutorial`.
+```sh unix
+curl -fsSL https://raw.githubusercontent.com/dhruv-hhai/share/main/install | bash
+```
 
-A file exchange needs a single secret exchange — nothing more, nothing less. Pairing does it for you over [croc](https://github.com/schollz/croc)'s PAKE, so no secret is ever typed or seen.
+## Guided tutorial in CLI
 
-## End to end
+```sh
+share tutorial
+```
 
-Alice wants to keep sharing a folder with Bob, without a persistent connection between their machines.
+## Example Quickstart 
 
-1. **Alice invites Bob.** Prints a short one-time code:
+![share push on one machine, share pull on another — a real transfer with the gates printed](.github/share.gif)
+
+## Full walkthrough 
+
+1. Generate an invite code for your friend 
    ```sh
    share friends invite bob
    ```
-2. **Bob accepts.** Alice tells him the code any way she likes — it's single-use and PAKE-protected, so even a plaintext channel is fine:
+2. They accept with the code — it's single-use and PAKE-protected, so tell them over any channel
    ```sh
    share friends accept alice <code>
    ```
-3. **Alice pushes** her folder (waits until Bob pulls):
+3. Push them a folder — waits until they pull
    ```sh
    share push --friend bob ./notes
    ```
-4. **Bob pulls** (lands in `~/share/alice/`):
+4. They pull — lands in `~/share/alice/`
    ```sh
    share pull --friend alice
    ```
 
-That's it. Repeat 3–4 whenever there's something new; Bob's copy gets overwritten.
+That's it. Pair once (1–2), then repeat 3–4 whenever there's something new; their copy gets overwritten.
 
 ## Commands
 
