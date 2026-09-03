@@ -11,34 +11,35 @@ run()  { printf '\n  %s$ %s%s\n' "$C" "$*" "$R"; read -rp "  [enter to run] "; "
 
 clear
 say "📦 share — a guided tour"
-note "share sends folders/files to friends over croc. A friend is just an env var you both set."
+note "share sends folders/files to friends over croc. A file exchange needs a single secret exchange."
 note "This tour plays both sides on this machine. (sandbox: $S)"
 
 say "1/5 — Who can you share with?"
 for v in $(env | sed -n 's/^\(SHARE_SECRET_[^=]*\)=.*/\1/p'); do unset "$v"; done   # clean slate
 run share friends
 note "Nobody yet. Try anyway — share tells you exactly what to do:"
-run share push --friend demo "$S"
+run share push --friend bob "$S"
 
 say "2/5 — Add a friend"
-note "Both of you run the same export (yours names them, theirs names you)."
-export SHARE_SECRET_DEMO="tour-$(openssl rand -hex 4)"
-run bash -c 'echo "export SHARE_SECRET_DEMO=\"$SHARE_SECRET_DEMO\""'
+note "One command registers them and prints the line they run to register you."
+export HOME="$S/home" SHELL=/bin/zsh; mkdir -p "$HOME"   # sandboxed rc file
+run share friends add bob paper-otter-sunday
+export SHARE_SECRET_DEMO="paper-otter-sunday"
 run share friends
 
 say "3/5 — The code is derived, never sent"
 note "sha256(passphrase | today) → same answer on both machines, rotates daily."
-run share code --friend demo
+run share code --friend bob
 
 say "4/5 — Push and pull"
 mkdir -p "$S/notes"; printf '# hello\n\nfrom the tour\n' > "$S/notes/hello.md"
 run ls -R "$S/notes"
 note "You push (it waits)…"
 read -rp "  [enter] "
-share push --friend demo "$S/notes" >/dev/null 2>&1 & P=$!
+share push --friend bob "$S/notes" >/dev/null 2>&1 & P=$!
 sleep 2
 note "…they pull:"
-run share pull --friend demo --dest "$S/inbox"
+run share pull --friend bob --dest "$S/inbox"
 wait "$P" 2>/dev/null || true; P=""
 run find "$S/inbox" -type f
 
@@ -46,10 +47,10 @@ say "5/5 — Their copy is a copy"
 note "Pulling again overwrites whatever they changed locally."
 echo "edited on their side" > "$S/inbox/notes/hello.md"
 run cat "$S/inbox/notes/hello.md"
-share push --friend demo "$S/notes" >/dev/null 2>&1 & P=$!
+share push --friend bob "$S/notes" >/dev/null 2>&1 & P=$!
 sleep 2
-run share pull --friend demo --dest "$S/inbox"
+run share pull --friend bob --dest "$S/inbox"
 wait "$P" 2>/dev/null || true; P=""
 run cat "$S/inbox/notes/hello.md"
 
-printf '\n%sThat is all of it: an env var, a derived code, croc. 📦%s\n\n' "$G" "$R"
+printf '\n%sThat is all of it: one shared secret, a derived code, croc. 📦%s\n\n' "$G" "$R"

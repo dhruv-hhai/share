@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# desc: who you can share with
-# usage: share friends
-# a friend is an env var SHARE_SECRET_<NAME>, same value on both machines.
-env | sed -n 's/^SHARE_SECRET_\([^=]*\)=.*/\1/p' | tr 'A-Z_' 'a-z-'
+# desc: who you can share with; add one
+# usage: share friends                 list
+#        share friends add NAME [SECRET]   register NAME (generates SECRET if omitted), prints what they run
+set -euo pipefail
+rc="${ZDOTDIR:-$HOME}/.$(basename "${SHELL:-zsh}")rc"
+case "${1:-}" in
+  add)
+    n="${2:?usage: share friends add NAME [SECRET]}"; s="${3:-$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')}"
+    var="SHARE_SECRET_$(tr 'a-z-' 'A-Z_' <<<"$n")"
+    grep -q "^export $var=" "$rc" 2>/dev/null && { echo "share: $n already in $rc — edit it there" >&2; exit 1; }
+    printf 'export %s="%s"\n' "$var" "$s" >> "$rc"
+    printf 'added %s to %s — run:  source %s\n\nsend %s this over something you trust:\n\n  share friends add %s %s\n' \
+      "$n" "$rc" "$rc" "$n" "$(whoami)" "$s";;
+  *) env | sed -n 's/^SHARE_SECRET_\([^=]*\)=.*/\1/p' | tr 'A-Z_' 'a-z-';;
+esac
