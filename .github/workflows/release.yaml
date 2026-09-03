@@ -122,6 +122,8 @@ jobs:
           echo "::notice::Rendered share.rb (sha256 ${SHA256})"
           cat share.rb
 
+      - uses: Homebrew/actions/setup-homebrew@fd832223f9f99ebf0244dd20658680e5d4aca049
+
       - name: brew audit --strict (throwaway local tap)
         run: |
           set -euo pipefail
@@ -147,6 +149,8 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: formula
+
+      - uses: Homebrew/actions/setup-homebrew@fd832223f9f99ebf0244dd20658680e5d4aca049
 
       - name: brew install + brew test from the real tag tarball
         run: |
