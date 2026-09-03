@@ -27,7 +27,7 @@ read -rp "  [enter to invite] "
 HOME="$S/home" share friends invite bob > "$S/invite.out" 2>&1 & P=$!
 until grep -q accept "$S/invite.out"; do sleep 0.2; done; sed 's/^/  /' "$S/invite.out"
 code="$(grep -oE 'accept [^ ]+ [a-z-]+' "$S/invite.out" | awk '{print $3}')"
-note "…on their machine, they run it:"
+note "...on their machine, they run it:"
 run env HOME="$S/them" share friends accept alice "$code"
 wait "$P" 2>/dev/null || true; P=""
 export SHARE_SECRET_BOB="$(sed -n 's/^export SHARE_SECRET_BOB="\(.*\)"$/\1/p' "$HOME/.zshrc")"
@@ -40,11 +40,11 @@ run share code --friend bob
 say "4/5 — Push and pull"
 mkdir -p "$S/notes"; printf '# hello\n\nfrom the tour\n' > "$S/notes/hello.md"
 run ls -R "$S/notes"
-note "You push (it waits)…"
+note "You push (it waits)..."
 read -rp "  [enter] "
 share push --friend bob "$S/notes" >/dev/null 2>&1 & P=$!
 sleep 2
-note "…they pull:"
+note "...they pull:"
 run share pull --friend bob --dest "$S/inbox"
 wait "$P" 2>/dev/null || true; P=""
 run find "$S/inbox" -type f

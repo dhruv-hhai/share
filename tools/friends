@@ -22,13 +22,13 @@ case "${1:-}" in
     until c="$(grep -oE 'croc [a-z]+(-[a-z]+)+' "$out" | head -1 | cut -d' ' -f2)" && [ -n "$c" ]; do
       kill -0 "$p" 2>/dev/null || { cat "$out" >&2; exit 1; }; sleep 0.2
     done
-    printf 'tell %s to run:\n\n  share friends accept %s %s\n\n(waiting for them…)\n' "$n" "$me" "$c"
+    printf 'tell %s to run:\n\n  share friends accept %s %s\n\n(waiting for them...)\n' "$n" "$me" "$c"
     wait "$p"
-    friends add "$n" "$s";;
+    "$0" add "$n" "$s";;
   accept)
     n="${2:?usage: share friends accept NAME CODE}"; c="${3:?usage: share friends accept NAME CODE}"
-    echo "pairing with $n… (Ctrl-C to cancel)" >&2
+    echo "pairing with $n... (Ctrl-C to cancel)" >&2
     s="$(CROC_SECRET="$c" croc --yes </dev/null 2>/dev/null)"; [ -n "$s" ] || { echo "share: pairing failed (wrong or used code?)" >&2; exit 1; }
-    friends add "$n" "$s";;
+    "$0" add "$n" "$s";;
   *) env | sed -n 's/^SHARE_SECRET_\([^=]*\)=.*/\1/p' | tr 'A-Z_' 'a-z-';;
 esac
