@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# desc: receive from a friend
+# usage: share pull --friend NAME [--dest DIR]      (default ~/share/NAME)
+set -euo pipefail
+f=""; d=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; --dest|-d) d="${2:?}"; shift 2;; *) shift;; esac; done
+[ -n "$f" ] || { echo "usage: share pull --friend NAME [--dest DIR]" >&2; exit 1; }
+CROC_SECRET="$(code -f "$f")"; export CROC_SECRET
+d="${d:-$HOME/share/$f}"; mkdir -p "$d" && cd "$d" && exec croc --yes --overwrite

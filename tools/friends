@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# desc: who you can share with
+# usage: share friends
+# a friend is an env var SHARE_SECRET_<NAME>, same value on both machines.
+env | sed -n 's/^SHARE_SECRET_\([^=]*\)=.*/\1/p' | tr 'A-Z_' 'a-z-'

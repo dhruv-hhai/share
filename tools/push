@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# desc: send paths to a friend (blocks until they pull)
+# usage: share push --friend NAME PATH...
+set -euo pipefail
+f=""; p=(); while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) p+=("$1"); shift;; esac; done
+[ -n "$f" ] && [ ${#p[@]} -gt 0 ] || { echo "usage: share push --friend NAME PATH..." >&2; exit 1; }
+CROC_SECRET="$(code -f "$f")"; export CROC_SECRET
+exec croc --yes send "${p[@]}"
