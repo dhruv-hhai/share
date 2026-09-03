@@ -44,7 +44,7 @@ share friends invite NAME          pair: prints a one-time code to tell them
 share friends accept NAME CODE     other side of a pairing
 share friends add NAME [SECRET]    register by hand
 share push --friend NAME PATH...   send (blocks until they pull)
-share pull --friend NAME [--dest]  receive (default ~/share/NAME)
+share pull --friend NAME [--dest]  receive (default ~/share/NAME; base movable via SHARE_PULL_DIR)
 share code --friend NAME           today's code, for debugging
 share tutorial                     guided tour in a sandbox
 ```
@@ -52,6 +52,8 @@ share tutorial                     guided tour in a sandbox
 Every step prints its gates: today's code (also usable as plain `croc <code>`), how long the relay holds an unclaimed room (~3h), and when the code rotates (UTC midnight — with a warning if that's imminent).
 
 Every command takes `--help`. The brew install checks for updates once a day and nudges `brew upgrade share`.
+
+State on disk, in full: one `export SHARE_SECRET_<NAME>=…` line per friend in your shell rc, and the files you pull. (croc itself keeps two small cache files in `~/.config/croc` — relay choice and version check.)
 
 ## Layout
 

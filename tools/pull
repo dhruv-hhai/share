@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # desc: receive from a friend
 # usage: share pull --friend NAME [--dest DIR]      (default ~/share/NAME)
+# SHARE_PULL_DIR moves the base folder: pulls land in $SHARE_PULL_DIR/NAME.
 set -euo pipefail
 f=""; d=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; --dest|-d) d="${2:?}"; shift 2;; *) shift;; esac; done
 [ -n "$f" ] || { echo "usage: share pull --friend NAME [--dest DIR]" >&2; exit 1; }
@@ -8,4 +9,4 @@ CROC_SECRET="$(code -f "$f")"; export CROC_SECRET
 left=$(( 86400 - $(date -u +%s) % 86400 ))
 printf 'share: [1/2] code for %s today: %s  (rotates at UTC midnight — in %dh%02dm)\n' "$f" "$CROC_SECRET" $((left/3600)) $(((left%3600)/60)) >&2
 printf 'share: [2/2] joining their room — needs an active push on their side (rooms wait ~3h)\n' >&2
-d="${d:-$HOME/share/$f}"; mkdir -p "$d" && cd "$d" && exec croc --yes --overwrite
+d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d" && cd "$d" && exec croc --yes --overwrite
