@@ -2,7 +2,7 @@
 
 Send files/folders across machines statelessly using [croc](https://github.com/schollz/croc).
 
-![how share works — pairing over PAKE, daily derived codes, async push/pull](.github/share.gif)
+![share push on one machine, share pull on another — a real transfer with the gates printed](.github/share.gif)
 
 Instant messaging & hosting platforms require personal identification to allow you to upload & share data on their servers. `share` needs neither: no account, no server that knows you, no state left behind — just a one-time code between two people.
 
