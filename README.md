@@ -58,7 +58,7 @@ That's it. Pair once (1–2), then repeat 3–4 whenever there's something new; 
 Keep one folder mirrored between two machines, continuously. Both sides run `sync` against their copy; edits propagate in seconds.
 
 1. Agree roles once, over any channel — one of you is `a`, the other is `b`. It's a coin flip: the letters just keep the two directions in separate relay rooms (both pushing into one room breaks it — every pull gets `relay admission rejected`).
-2. Each side starts the loop (it runs in the foreground — keep it in tmux):
+2. Each side starts it — it goes to the background on its own:
    ```sh
    # alice
    share sync --friend bob --role a
@@ -66,6 +66,13 @@ Keep one folder mirrored between two machines, continuously. Both sides run `syn
    share sync --friend alice --role b
    ```
    Default folder is the same one `pull` uses — `~/share/<friend>/` (or `$SHARE_PULL_DIR/<friend>`); override with `--dir`.
+3. Manage it:
+   ```sh
+   share sync status                  # every daemon: friend, role, pid, dir
+   share sync log --friend bob        # log path + last lines
+   share sync stop --friend bob       # kills the whole tree, croc included
+   ```
+   `--fg` runs it in the foreground instead (debugging). Daemons don't survive a reboot — rerun sync (or add it to cron/launchd).
 
 How it stays cheap: a push only happens when the folder's content hash changes, croc then skips files the other side already has (only changed bytes travel), and whatever you just pulled is never echoed straight back.
 
@@ -80,8 +87,9 @@ What raw sync does **not** do (yet — git-bundle sync is planned):
 share tutorial                     guided tour in a sandbox
 share push --friend NAME PATH...   send (blocks until they pull)
 share pull --friend NAME [--dest]  receive (default ~/share/NAME; base movable via SHARE_PULL_DIR)
-share sync --friend NAME --role a|b [--dir DIR] [--every SEC]
-                                   two-way folder sync loop (roles: one side a, other b)
+share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
+                                   two-way folder sync daemon (roles: one side a, other b)
+share sync status|stop|log         manage sync daemons
 share friends                      who you can share with
 share friends invite NAME          pair: prints a one-time code to tell them
 share friends accept NAME CODE     other side of a pairing

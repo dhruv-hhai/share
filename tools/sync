@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # desc: continuous two-way folder sync with a friend (raw files, last-writer-wins)
-# usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC]
+# usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
+#        share sync status                 every sync daemon: friend, role, pid, dir
+#        share sync stop --friend NAME     stop one (kills the whole process tree)
+#        share sync log --friend NAME      where the log is + last lines
+# Runs in the background by default (its own process group; log in $TMPDIR).
 # Two direction-scoped rooms on one secret (code --salt): role a pushes on
 # sync-a2b and pulls sync-b2a; role b the opposite — agree roles once, out of
 # band. The pusher sends the whole folder only when its content hash changes
@@ -12,18 +16,74 @@
 # sync); dotfiles are neither sent nor hashed. Merge/delete semantics arrive
 # with git-bundle sync.
 set -euo pipefail
-f=""; role=""; d=""; every=15
+tmp="${TMPDIR:-/tmp}"
+
+case "${1:-}" in
+  status)
+    found=""
+    for pf in "$tmp"/share-sync-*.pid; do
+      [ -f "$pf" ] || continue; found=1
+      read -r pid role dir log < "$pf"
+      name="$(basename "$pf" .pid)"; name="${name#share-sync-}"
+      if kill -0 "$pid" 2>/dev/null; then st=running; else st=stale; fi
+      printf '%-12s role %s  %-8s pid %-6s %s\n' "$name" "$role" "$st" "$pid" "$dir"
+    done
+    [ -n "$found" ] || echo "no sync daemons"
+    exit 0;;
+  stop)
+    shift; f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done
+    [ -n "$f" ] || { echo "usage: share sync stop --friend NAME" >&2; exit 1; }
+    pf="$tmp/share-sync-$f.pid"
+    [ -f "$pf" ] || { echo "share sync: nothing running for $f" >&2; exit 1; }
+    read -r pid _ < "$pf"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    rm -f "$pf"
+    echo "share sync: stopped $f (pid $pid and its tree)"
+    exit 0;;
+  log)
+    shift; f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done
+    [ -n "$f" ] || { echo "usage: share sync log --friend NAME" >&2; exit 1; }
+    lg="$tmp/share-sync-$f.log"
+    [ -f "$lg" ] || { echo "share sync: no log for $f" >&2; exit 1; }
+    echo "$lg"; tail -20 "$lg"
+    exit 0;;
+esac
+
+f=""; role=""; d=""; every=15; fg=""
 while [ $# -gt 0 ]; do case "$1" in
   --friend|-f) f="${2:?}"; shift 2;;
   --role|-r)   role="${2:?}"; shift 2;;
   --dir)       d="${2:?}"; shift 2;;
   --every)     every="${2:?}"; shift 2;;
+  --fg)        fg=1; shift;;
   *) shift;;
 esac; done
-{ [ -n "$f" ] && { [ "$role" = a ] || [ "$role" = b ]; }; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC]" >&2; exit 1; }
+{ [ -n "$f" ] && { [ "$role" = a ] || [ "$role" = b ]; }; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]" >&2; exit 1; }
+code -f "$f" >/dev/null   # fail on unknown friend BEFORE daemonizing
 d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"
+pidf="$tmp/share-sync-$f.pid"; lg="$tmp/share-sync-$f.log"
+
+if [ -z "$fg" ]; then
+  if [ -f "$pidf" ] && read -r opid _ < "$pidf" && kill -0 "$opid" 2>/dev/null; then
+    echo "share sync: already running for $f (pid $opid) — stop it first:  share sync stop --friend $f" >&2; exit 1
+  fi
+  # own process group (setsid) so stop can kill the whole tree: loops, push/pull, croc
+  if command -v perl >/dev/null; then sid=(perl -MPOSIX -e 'setsid; exec @ARGV' --)
+  elif command -v python3 >/dev/null; then sid=(python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
+  else echo "share sync: no perl/python3 to daemonize — run with --fg yourself" >&2; exit 1; fi
+  nohup "${sid[@]}" "$0" --fg --friend "$f" --role "$role" --dir "$d" --every "$every" >> "$lg" 2>&1 &
+  pid=$!
+  printf '%s %s %s %s\n' "$pid" "$role" "$d" "$lg" > "$pidf"
+  echo "share sync: $f (role $role) syncing $d in the background (pid $pid)"
+  echo "share sync:   log:  share sync log --friend $f"
+  echo "share sync:   stop: share sync stop --friend $f"
+  exit 0
+fi
+
+# --- foreground loops ---
 if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in_="sync-a2b"; fi
-state="${TMPDIR:-/tmp}/share-sync-$f-$role.hash"   # last content hash known to be on both sides
+state="$tmp/share-sync-$f-$role.hash"   # last content hash known to be on both sides
+printf '%s %s %s %s\n' "$$" "$role" "$d" "$lg" > "$pidf"
 
 log()     { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 dirhash() { (cd "$d" && find . -type f ! -path '*/.*' -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | cut -d' ' -f1); }
@@ -50,7 +110,7 @@ puller() {
   done
 }
 
-log "$d <-> $f (role $role, every ${every}s) — Ctrl-C stops"
+log "$d <-> $f (role $role, every ${every}s)"
 pusher & pp=$!
 puller & lp=$!
 trap 'kill "$pp" "$lp" 2>/dev/null; exit 0' INT TERM
