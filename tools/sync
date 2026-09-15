@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# desc: continuous two-way folder sync with a friend (raw files, last-writer-wins)
+# desc: continuous two-way folder sync with a friend — git-merged, nothing lost
 # usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
 #        share sync status                 every sync daemon: friend, role, pid, dir
 #        share sync stop --friend NAME     stop one (kills the whole process tree)
 #        share sync log --friend NAME      where the log is + last lines
 # Runs in the background by default (its own process group; log in $TMPDIR).
-# Two direction-scoped rooms on one secret (code --salt): role a pushes on
-# sync-a2b and pulls sync-b2a; role b the opposite — agree roles once, out of
-# band. The pusher sends the whole folder only when its content hash changes
-# (croc skips identical files on the receiving end, so unchanged bytes never
-# travel); the puller waits politely and applies. Default DIR is the same
-# folder pull uses: $SHARE_PULL_DIR/NAME (or ~/share/NAME).
-# CAVEATS (raw sync, no history): concurrent edits to one file are
-# last-writer-wins; deletes do NOT propagate (the file returns on the next
-# sync); dotfiles are neither sent nor hashed. Merge/delete semantics arrive
-# with git-bundle sync.
+# Needs the git BINARY only — no account, no remote, no network git: each side
+# keeps a local repo inside the folder and what travels (over the same croc
+# relay, in two direction-scoped rooms via code --salt) is a git bundle file.
+# Role a pushes on sync-a2b and pulls sync-b2a; role b the opposite — agree
+# roles once, out of band.
+# Semantics: edits are committed locally, bundles are merged on arrival.
+# Deletes propagate. Concurrent edits to one text file (*.md/*.txt) merge as
+# append-both (union); other conflicting files keep YOURS in place and save
+# THEIRS beside it as NAME.conflict-<timestamp> — no byte is ever dropped.
+# A stale queued push can no longer eat a local edit: merging, not overwriting.
+# CAVEATS: union merge is line-based — simultaneous edits to the same line
+# arrive as both lines, adjacent; history grows in .git (squash if you care).
 set -euo pipefail
 tmp="${TMPDIR:-/tmp}"
 
@@ -37,7 +39,7 @@ case "${1:-}" in
     [ -f "$pf" ] || { echo "share sync: nothing running for $f" >&2; exit 1; }
     read -r pid _ < "$pf"
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    rm -f "$pf"
+    rm -f "$pf" "$tmp/share-sync-$f.gitlock" 2>/dev/null; rmdir "$tmp/share-sync-$f.gitlock" 2>/dev/null || true
     echo "share sync: stopped $f (pid $pid and its tree)"
     exit 0;;
   log)
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) shift;;
 esac; done
 { [ -n "$f" ] && { [ "$role" = a ] || [ "$role" = b ]; }; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]" >&2; exit 1; }
+command -v git >/dev/null || { echo "share sync: needs the git binary (no account or remote — local repo only). macOS: xcode-select --install" >&2; exit 1; }
 code -f "$f" >/dev/null   # fail on unknown friend BEFORE daemonizing
 d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"
 pidf="$tmp/share-sync-$f.pid"; lg="$tmp/share-sync-$f.log"
@@ -80,38 +83,71 @@ if [ -z "$fg" ]; then
   exit 0
 fi
 
-# --- foreground loops ---
+# --- git-backed engine (foreground) ---
 if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in_="sync-a2b"; fi
-state="$tmp/share-sync-$f-$role.hash"   # last content hash known to be on both sides
 printf '%s %s %s %s\n' "$$" "$role" "$d" "$lg" > "$pidf"
+stage="$tmp/share-sync-$f-in"; mkdir -p "$stage"
+lk="$tmp/share-sync-$f.gitlock"   # mkdir-lock serializes the two loops on one repo
 
-log()     { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-dirhash() { (cd "$d" && find . -type f ! -path '*/.*' -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | cut -d' ' -f1); }
+log()    { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+G()      { git -C "$d" "$@"; }
+lock()   { until mkdir "$lk" 2>/dev/null; do sleep 0.2; done; }
+unlock() { rmdir "$lk" 2>/dev/null || true; }
+
+if [ ! -d "$d/.git" ]; then
+  git init -q "$d"
+  [ -f "$d/.gitattributes" ] || printf '*.md merge=union\n*.txt merge=union\n' > "$d/.gitattributes"
+fi
+# local identity so commits work with zero git setup — never touches global config
+G config user.email >/dev/null 2>&1 || { G config user.name "share-sync"; G config user.email "sync@share.local"; }
+
+commit_dirty() { G add -A; G diff --cached --quiet 2>/dev/null || G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)"; }
 
 pusher() {
+  bf="$tmp/share-sync-$f-out.bundle"
   while :; do
-    h="$(dirhash)"
-    if [ "$h" != "$(cat "$state" 2>/dev/null)" ]; then
-      files=(); for p in "$d"/*; do [ -e "$p" ] && files+=("$p"); done
-      if [ ${#files[@]} -gt 0 ]; then
-        # blocks until they pull — that block is the delivery ack
-        if push --friend "$f" --salt "$out" "${files[@]}" >/dev/null 2>&1; then
-          printf '%s' "$h" > "$state"; log "pushed"
-        else log "push failed — retrying in ${every}s"; sleep "$every"; fi
-      else sleep "$every"; fi
-    else sleep "$every"; fi
+    lock; commit_dirty
+    head="$(G rev-parse -q --verify HEAD 2>/dev/null || true)"
+    sent="$(G rev-parse -q --verify refs/share/sent 2>/dev/null || true)"
+    if [ -n "$head" ] && [ "$head" != "$sent" ]; then
+      G bundle create "$bf" HEAD >/dev/null 2>&1; unlock
+      # blocks until they pull — that block is the delivery ack
+      if push --friend "$f" --salt "$out" "$bf" >/dev/null 2>&1; then
+        lock; G update-ref refs/share/sent "$head"; unlock; log "pushed ${head:0:7}"
+      else log "push failed — retrying in ${every}s"; sleep "$every"; fi
+    else unlock; sleep "$every"; fi
   done
 }
+
 puller() {
   while :; do
-    if pull --friend "$f" --salt "$in_" --dest "$d" --quiet >/dev/null 2>&1; then
-      printf '%s' "$(dirhash)" > "$state"; log "pulled"   # what they sent is now common state — do not echo it back
+    rm -f "$stage"/*.bundle
+    if pull --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1; then
+      bundle=""; for b in "$stage"/*.bundle; do [ -f "$b" ] && bundle="$b"; done
+      [ -n "$bundle" ] || { log "pull delivered no bundle — ignored"; continue; }
+      lock; commit_dirty
+      if ! G fetch -q "$bundle" HEAD 2>/dev/null; then log "bad bundle — skipped"; unlock; continue; fi
+      if ! G rev-parse -q --verify HEAD >/dev/null 2>&1; then
+        G reset -q --hard FETCH_HEAD; log "adopted their history"
+      elif G merge -q --no-edit --allow-unrelated-histories FETCH_HEAD >/dev/null 2>&1; then
+        log "merged theirs"
+      else
+        # union handled text conflicts; leftovers keep OURS, save THEIRS beside — nothing dropped
+        while IFS= read -r p; do
+          [ -n "$p" ] || continue
+          G show ":3:$p" > "$d/$p.conflict-$(date +%F-%H%M%S)" 2>/dev/null || true
+          G checkout --ours -- "$p" 2>/dev/null || true
+        done < <(G diff --name-only --diff-filter=U)
+        G add -A; G commit -qm "sync: conflict — kept ours, saved theirs as .conflict-*"
+        log "merged with conflict copies"
+      fi
+      unlock
     else sleep "$every"; fi
   done
 }
 
-log "$d <-> $f (role $role, every ${every}s)"
+log "$d <-> $f (role $role, every ${every}s, git-merged)"
 pusher & pp=$!
 puller & lp=$!
-trap 'kill "$pp" "$lp" 2>/dev/null; exit 0' INT TERM
+trap 'kill "$pp" "$lp" 2>/dev/null; unlock; exit 0' INT TERM
 wait

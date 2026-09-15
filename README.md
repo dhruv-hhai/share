@@ -73,12 +73,12 @@ Keep one folder mirrored between two machines, continuously — picking up where
    ```
    `--fg` runs it in the foreground instead (debugging). Daemons don't survive a reboot — rerun sync (or add it to cron/launchd).
 
-How it stays cheap: a push only happens when the folder's content hash changes, croc then skips files the other side already has (only changed bytes travel), and whatever you just pulled is never echoed straight back.
-
-What raw sync does **not** do (yet — git-bundle sync is planned):
-- concurrent edits to the same file are last-writer-wins, whole file
-- deletes don't propagate — a file removed on one side returns on the next sync
-- dotfiles are neither sent nor hashed
+Under the hood each side keeps a **local git repo** in the folder — the git *binary* only, no account, no remote, no network git; what travels over the relay is a git bundle. That buys real sync semantics:
+- **nothing is ever dropped** — edits are committed before any merge, so a stale incoming copy can't overwrite your work
+- concurrent edits to one text file (`*.md`/`*.txt`) merge as **append-both** (git union merge); same-line edits arrive as adjacent lines
+- other file types that truly conflict keep **yours** in place and save **theirs** beside it as `NAME.conflict-<timestamp>`
+- **deletes propagate**; full history sits in `.git` on each side (squash if it ever bothers you)
+- a push only happens when there are new commits, and it blocks until received — that's the delivery ack
 
 ## Commands
 
