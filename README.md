@@ -55,17 +55,16 @@ That's it. Pair once (1–2), then repeat 3–4 whenever there's something new; 
 
 ## Auto-sync (two-way)
 
-Keep one folder mirrored between two machines, continuously. Both sides run `sync` against their copy; edits propagate in seconds.
+Keep one folder mirrored between two machines, continuously — picking up where the walkthrough left off: alice's `./notes`, which bob's pull landed in `~/share/alice/`. Both sides run `sync` against their copy; edits propagate in seconds.
 
 1. Agree roles once, over any channel — one of you is `a`, the other is `b`. It's a coin flip: the letters just keep the two directions in separate relay rooms (both pushing into one room breaks it — every pull gets `relay admission rejected`).
 2. Each side starts it — it goes to the background on its own:
    ```sh
-   # alice
-   share sync --friend bob --role a
-   # bob
+   # alice — her original folder
+   share sync --friend bob --role a --dir ./notes
+   # bob — his pulled copy (the default: ~/share/<friend>/, movable via SHARE_PULL_DIR)
    share sync --friend alice --role b
    ```
-   Default folder is the same one `pull` uses — `~/share/<friend>/` (or `$SHARE_PULL_DIR/<friend>`); override with `--dir`.
 3. Manage it:
    ```sh
    share sync status                  # every daemon: friend, role, pid, dir
