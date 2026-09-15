@@ -68,7 +68,8 @@ Keep one folder mirrored between two machines, continuously — picking up where
 3. Manage it:
    ```sh
    share sync status                  # every daemon: friend, role, pid, dir
-   share sync log --friend bob        # log path + last lines
+   share sync log --friend bob        # daemon log: pushes/pulls as they happen
+   share sync history --friend bob    # file-level audit: who, when, A/M/D per file
    share sync stop --friend bob       # kills the whole tree, croc included
    ```
    `--fg` runs it in the foreground instead (debugging). Daemons don't survive a reboot — rerun sync (or add it to cron/launchd).
@@ -88,7 +89,7 @@ share push --friend NAME PATH...   send (blocks until they pull)
 share pull --friend NAME [--dest]  receive (default ~/share/NAME; base movable via SHARE_PULL_DIR)
 share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
                                    two-way folder sync daemon (roles: one side a, other b)
-share sync status|stop|log         manage sync daemons
+share sync status|stop|log|history manage sync daemons; history = per-file audit trail
 share friends                      who you can share with
 share friends invite NAME          pair: prints a one-time code to tell them
 share friends accept NAME CODE     other side of a pairing

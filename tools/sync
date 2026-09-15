@@ -4,6 +4,7 @@
 #        share sync status                 every sync daemon: friend, role, pid, dir
 #        share sync stop --friend NAME     stop one (kills the whole process tree)
 #        share sync log --friend NAME      where the log is + last lines
+#        share sync history --friend NAME [N]   last N file changes (default 20): who, when, A/M/D per file
 # Runs in the background by default (its own process group; log in $TMPDIR).
 # Needs the git BINARY only — no account, no remote, no network git: each side
 # keeps a local repo inside the folder and what travels (over the same croc
@@ -48,6 +49,16 @@ case "${1:-}" in
     lg="$tmp/share-sync-$f.log"
     [ -f "$lg" ] || { echo "share sync: no log for $f" >&2; exit 1; }
     echo "$lg"; tail -20 "$lg"
+    exit 0;;
+  history)
+    shift; f=""; n=20; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; [0-9]*) n="$1"; shift;; *) shift;; esac; done
+    [ -n "$f" ] || { echo "usage: share sync history --friend NAME [N]" >&2; exit 1; }
+    hd=""; pf="$tmp/share-sync-$f.pid"
+    [ -f "$pf" ] && read -r _ _ hd _ < "$pf"
+    [ -n "$hd" ] || hd="${SHARE_PULL_DIR:-$HOME/share}/$f"
+    [ -d "$hd/.git" ] || { echo "share sync: no sync history at $hd" >&2; exit 1; }
+    # mine = commits made here; theirs arrive inside merge commits — --first-parent keeps the local timeline
+    git -C "$hd" log -"$n" --date=format:'%m-%d %H:%M' --pretty='%ad  %s' --name-status | sed '/^$/d'
     exit 0;;
 esac
 
@@ -129,8 +140,8 @@ puller() {
       if ! G fetch -q "$bundle" HEAD 2>/dev/null; then log "bad bundle — skipped"; unlock; continue; fi
       if ! G rev-parse -q --verify HEAD >/dev/null 2>&1; then
         G reset -q --hard FETCH_HEAD; log "adopted their history"
-      elif G merge -q --no-edit --allow-unrelated-histories FETCH_HEAD >/dev/null 2>&1; then
-        log "merged theirs"
+      elif G merge -q -m "sync: received from $f" --allow-unrelated-histories FETCH_HEAD >/dev/null 2>&1; then
+        log "merged theirs: $(G diff --name-only 'HEAD@{1}' HEAD 2>/dev/null | paste -sd, - | cut -c1-120)"
       else
         # union handled text conflicts; leftovers keep OURS, save THEIRS beside — nothing dropped
         while IFS= read -r p; do
