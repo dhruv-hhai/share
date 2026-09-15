@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# desc: continuous two-way folder sync with a friend (raw files, last-writer-wins)
+# usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC]
+# Two direction-scoped rooms on one secret (code --salt): role a pushes on
+# sync-a2b and pulls sync-b2a; role b the opposite — agree roles once, out of
+# band. The pusher sends the whole folder only when its content hash changes
+# (croc skips identical files on the receiving end, so unchanged bytes never
+# travel); the puller waits politely and applies. Default DIR is the same
+# folder pull uses: $SHARE_PULL_DIR/NAME (or ~/share/NAME).
+# CAVEATS (raw sync, no history): concurrent edits to one file are
+# last-writer-wins; deletes do NOT propagate (the file returns on the next
+# sync); dotfiles are neither sent nor hashed. Merge/delete semantics arrive
+# with git-bundle sync.
+set -euo pipefail
+f=""; role=""; d=""; every=15
+while [ $# -gt 0 ]; do case "$1" in
+  --friend|-f) f="${2:?}"; shift 2;;
+  --role|-r)   role="${2:?}"; shift 2;;
+  --dir)       d="${2:?}"; shift 2;;
+  --every)     every="${2:?}"; shift 2;;
+  *) shift;;
+esac; done
+{ [ -n "$f" ] && { [ "$role" = a ] || [ "$role" = b ]; }; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC]" >&2; exit 1; }
+d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"
+if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in_="sync-a2b"; fi
+state="${TMPDIR:-/tmp}/share-sync-$f-$role.hash"   # last content hash known to be on both sides
+
+log()     { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+dirhash() { (cd "$d" && find . -type f ! -path '*/.*' -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | cut -d' ' -f1); }
+
+pusher() {
+  while :; do
+    h="$(dirhash)"
+    if [ "$h" != "$(cat "$state" 2>/dev/null)" ]; then
+      files=(); for p in "$d"/*; do [ -e "$p" ] && files+=("$p"); done
+      if [ ${#files[@]} -gt 0 ]; then
+        # blocks until they pull — that block is the delivery ack
+        if push --friend "$f" --salt "$out" "${files[@]}" >/dev/null 2>&1; then
+          printf '%s' "$h" > "$state"; log "pushed"
+        else log "push failed — retrying in ${every}s"; sleep "$every"; fi
+      else sleep "$every"; fi
+    else sleep "$every"; fi
+  done
+}
+puller() {
+  while :; do
+    if pull --friend "$f" --salt "$in_" --dest "$d" --quiet >/dev/null 2>&1; then
+      printf '%s' "$(dirhash)" > "$state"; log "pulled"   # what they sent is now common state — do not echo it back
+    else sleep "$every"; fi
+  done
+}
+
+log "$d <-> $f (role $role, every ${every}s) — Ctrl-C stops"
+pusher & pp=$!
+puller & lp=$!
+trap 'kill "$pp" "$lp" 2>/dev/null; exit 0' INT TERM
+wait

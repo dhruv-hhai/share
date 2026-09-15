@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # desc: send paths to a friend (blocks until they pull; serves ONE pull, then exits)
-# usage: share push --friend NAME PATH...
+# usage: share push --friend NAME [--salt SALT] PATH...
 set -euo pipefail
-f=""; p=(); while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) p+=("$1"); shift;; esac; done
+f=""; s=""; p=(); while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; --salt) s="${2:?}"; shift 2;; *) p+=("$1"); shift;; esac; done
 [ -n "$f" ] && [ ${#p[@]} -gt 0 ] || { echo "usage: share push --friend NAME PATH..." >&2; exit 1; }
-CROC_SECRET="$(code -f "$f")"; export CROC_SECRET
+CROC_SECRET="$(code -f "$f" ${s:+--salt "$s"})"; export CROC_SECRET
 # two pushes on one code break the room — every pull gets 'relay admission rejected'
-lock="${TMPDIR:-/tmp}/share-push-$f.pid"
+lock="${TMPDIR:-/tmp}/share-push-$f${s:+-$s}.pid"
 if [ -f "$lock" ] && kill -0 "$(cat "$lock")" 2>/dev/null; then
   echo "share: a push to $f is already live (pid $(cat "$lock")) — two pushes on one code reject every pull. Kill it first:  kill $(cat "$lock")" >&2; exit 1
 fi

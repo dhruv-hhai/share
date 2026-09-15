@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # desc: today's croc code for a friend
-# usage: share code --friend NAME
-# sha256(SHARE_SECRET_<NAME>|UTC-date)[:24] — derived on both ends, rotates daily, never sent.
+# usage: share code --friend NAME [--salt SALT]
+# sha256(SHARE_SECRET_<NAME>|UTC-date[|SALT])[:24] — derived on both ends, rotates daily, never sent.
+# SALT scopes a separate room on the same secret (sync uses sync-a2b / sync-b2a).
 set -euo pipefail
-f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done
+f=""; s=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; --salt) s="${2:?}"; shift 2;; *) shift;; esac; done
 [ -n "$f" ] || { echo "usage: share code --friend NAME" >&2; exit 1; }
 var="SHARE_SECRET_$(tr 'a-z-' 'A-Z_' <<<"$f")"
 [ -n "${!var:-}" ] || { echo "share: no secret for $f — register them:  share friends add $f" >&2; exit 1; }
-printf '%s|%s' "${!var}" "$(date -u +%F)" | openssl dgst -sha256 -hex | sed 's/.*= //' | cut -c1-24
+printf '%s|%s%s' "${!var}" "$(date -u +%F)" "${s:+|$s}" | openssl dgst -sha256 -hex | sed 's/.*= //' | cut -c1-24
