@@ -16,6 +16,9 @@
 # append-both (union); other conflicting files keep YOURS in place and save
 # THEIRS beside it as NAME.conflict-<timestamp> — no byte is ever dropped.
 # A stale queued push can no longer eat a local edit: merging, not overwriting.
+# Protocol: the payload is a single file named share-sync-v1.bundle — anything
+# else arriving in the sync room is an incompatible peer and is refused LOUDLY
+# (both sides must run the same major version; payload changes bump the major).
 # CAVEATS: union merge is line-based — simultaneous edits to the same line
 # arrive as both lines, adjacent; history grows in .git (squash if you care).
 set -euo pipefail
@@ -115,7 +118,7 @@ G config user.email >/dev/null 2>&1 || { G config user.name "share-sync"; G conf
 commit_dirty() { G add -A; G diff --cached --quiet 2>/dev/null || G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)"; }
 
 pusher() {
-  bf="$tmp/share-sync-$f-out.bundle"
+  bd="$tmp/share-sync-$f-out"; mkdir -p "$bd"; bf="$bd/share-sync-v1.bundle"   # payload name IS the protocol version
   while :; do
     lock; commit_dirty
     head="$(G rev-parse -q --verify HEAD 2>/dev/null || true)"
@@ -132,10 +135,13 @@ pusher() {
 
 puller() {
   while :; do
-    rm -f "$stage"/*.bundle
+    rm -rf "$stage"; mkdir -p "$stage"
     if pull --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1; then
-      bundle=""; for b in "$stage"/*.bundle; do [ -f "$b" ] && bundle="$b"; done
-      [ -n "$bundle" ] || { log "pull delivered no bundle — ignored"; continue; }
+      bundle="$stage/share-sync-v1.bundle"
+      if [ ! -f "$bundle" ]; then
+        log "INCOMPATIBLE PEER — $f sent $(ls "$stage" | head -3 | paste -sd, -) instead of share-sync-v1.bundle; both sides must run the same major version: brew upgrade share"
+        sleep "$every"; continue
+      fi
       lock; commit_dirty
       if ! G fetch -q "$bundle" HEAD 2>/dev/null; then log "bad bundle — skipped"; unlock; continue; fi
       if ! G rev-parse -q --verify HEAD >/dev/null 2>&1; then
