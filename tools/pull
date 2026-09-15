@@ -1,29 +1,50 @@
 #!/usr/bin/env bash
-# desc: receive from a friend (waits for their push)
+# desc: receive from a friend (waits for their push without holding the room open)
 # usage: share pull --friend NAME [--dest DIR]      (default ~/share/NAME)
 # SHARE_PULL_DIR moves the base folder: pulls land in $SHARE_PULL_DIR/NAME.
-# Waits: a pull with no live push is rejected by the relay, so we retry every
-# 15s until their push appears (Ctrl-C stops). The code is re-derived each try,
-# surviving the UTC-midnight rotation. A push serves ONE pull, then exits.
+# Waits politely: a receiver parked at the relay before the push exists can
+# poison the room (sender dies with 'could not secure channel'). So each try
+# either transfers, or — on 'relay admission rejected' / 'waiting for sender'
+# with no data flowing — is torn down and retried 15s later. The code is
+# re-derived each try, surviving the UTC-midnight rotation.
 set -euo pipefail
 f=""; d=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; --dest|-d) d="${2:?}"; shift 2;; *) shift;; esac; done
 [ -n "$f" ] || { echo "usage: share pull --friend NAME [--dest DIR]" >&2; exit 1; }
 d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"; cd "$d"
+
 waited=""
+so="$(mktemp)"; se="$(mktemp)"
+cleanup() { rm -f "$so" "$se"; [ -z "${pid:-}" ] || kill "$pid" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
 while :; do
   CROC_SECRET="$(code -f "$f")"; export CROC_SECRET
   left=$(( 86400 - $(date -u +%s) % 86400 ))
   [ -n "$waited" ] || printf 'share: [1/2] code for %s today: %s  (rotates at UTC midnight — in %dh%02dm)\n' "$f" "$CROC_SECRET" $((left/3600)) $(((left%3600)/60)) >&2
   [ -n "$waited" ] || printf 'share: [2/2] joining their push — waiting until one is live (each push serves ONE pull)\n' >&2
-  # croc puts fatal errors on stdout; received files land in cwd, so capturing stdout is safe
-  if out="$(croc --yes --overwrite)"; then
-    [ -z "$out" ] || printf '%s\n' "$out"
-    exit 0
+
+  : > "$so"; : > "$se"
+  # stdout carries croc fatal errors; stderr carries progress — shown live AND watched
+  croc --yes --overwrite > "$so" 2> >(tee "$se" >&2) & pid=$!
+
+  idle=""
+  while kill -0 "$pid" 2>/dev/null; do
+    if grep -q 'waiting for sender' "$se" 2>/dev/null; then
+      # admitted but no sender — grace period, then tear down rather than hold the room
+      sleep 3
+      if kill -0 "$pid" 2>/dev/null && ! grep -qE 'Receiving|%' "$se" 2>/dev/null; then
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; idle=1
+      fi
+      break
+    fi
+    sleep 0.3
+  done
+  if [ -z "$idle" ]; then
+    if wait "$pid"; then pid=""; [ -s "$so" ] && cat "$so"; exit 0; fi
+    pid=""
+    grep -q 'relay admission rejected' "$so" || { [ -s "$so" ] && cat "$so" >&2; exit 1; }
   fi
-  case "$out" in
-    *"relay admission rejected"*)  # croc-11-ese for: no room, i.e. no push live right now
-      [ -n "$waited" ] || printf 'share: no push from %s yet — retrying every 15s (Ctrl-C stops; they run: share push --friend %s PATH)\n' "$f" "$(whoami)" >&2
-      waited=1; sleep 15;;
-    *) [ -z "$out" ] || printf '%s\n' "$out" >&2; exit 1;;
-  esac
+  pid=""
+  [ -n "$waited" ] || printf '\nshare: no push from %s yet — retrying every 15s without holding the room (Ctrl-C stops; they run: share push --friend %s PATH)\n' "$f" "$(whoami)" >&2
+  waited=1; sleep 15
 done
