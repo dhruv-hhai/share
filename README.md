@@ -53,17 +53,40 @@ share tutorial
 
 That's it. Pair once (1–2), then repeat 3–4 whenever there's something new; their copy gets overwritten.
 
+## Auto-sync (two-way)
+
+Keep one folder mirrored between two machines, continuously. Both sides run `sync` against their copy; edits propagate in seconds.
+
+1. Agree roles once, over any channel — one of you is `a`, the other is `b`. It's a coin flip: the letters just keep the two directions in separate relay rooms (both pushing into one room breaks it — every pull gets `relay admission rejected`).
+2. Each side starts the loop (it runs in the foreground — keep it in tmux):
+   ```sh
+   # alice
+   share sync --friend bob --role a
+   # bob
+   share sync --friend alice --role b
+   ```
+   Default folder is the same one `pull` uses — `~/share/<friend>/` (or `$SHARE_PULL_DIR/<friend>`); override with `--dir`.
+
+How it stays cheap: a push only happens when the folder's content hash changes, croc then skips files the other side already has (only changed bytes travel), and whatever you just pulled is never echoed straight back.
+
+What raw sync does **not** do (yet — git-bundle sync is planned):
+- concurrent edits to the same file are last-writer-wins, whole file
+- deletes don't propagate — a file removed on one side returns on the next sync
+- dotfiles are neither sent nor hashed
+
 ## Commands
 
 ```
 share tutorial                     guided tour in a sandbox
 share push --friend NAME PATH...   send (blocks until they pull)
 share pull --friend NAME [--dest]  receive (default ~/share/NAME; base movable via SHARE_PULL_DIR)
+share sync --friend NAME --role a|b [--dir DIR] [--every SEC]
+                                   two-way folder sync loop (roles: one side a, other b)
 share friends                      who you can share with
 share friends invite NAME          pair: prints a one-time code to tell them
 share friends accept NAME CODE     other side of a pairing
 share friends add NAME [SECRET]    register by hand
-share code --friend NAME           today's code, for debugging
+share code --friend NAME [--salt]  today's code, for debugging (salt = named room, used by sync)
 ```
 
 Every step prints its gates: today's code (also usable as plain `croc <code>`), how long the relay holds an unclaimed room (~3h), and when the code rotates (UTC midnight — with a warning if that's imminent).
@@ -80,6 +103,7 @@ tools/code       today's croc code for a friend — derived on both ends, rotate
 tools/friends    who you can share with; `invite`/`accept` pair, `add` registers by hand
 tools/pull       receive from a friend
 tools/push       send paths to a friend
+tools/sync       continuous two-way folder sync — composes push/pull on salted rooms
 tools/tutorial   guided tour; real push/pull with yourself in a sandbox
 ```
 
