@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# desc: send paths to a friend (blocks until they pull)
+# desc: send paths to a friend (blocks until they pull; serves ONE pull, then exits)
 # usage: share push --friend NAME PATH...
 set -euo pipefail
 f=""; p=(); while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) p+=("$1"); shift;; esac; done
 [ -n "$f" ] && [ ${#p[@]} -gt 0 ] || { echo "usage: share push --friend NAME PATH..." >&2; exit 1; }
 CROC_SECRET="$(code -f "$f")"; export CROC_SECRET
+# two pushes on one code break the room — every pull gets 'relay admission rejected'
+lock="${TMPDIR:-/tmp}/share-push-$f.pid"
+if [ -f "$lock" ] && kill -0 "$(cat "$lock")" 2>/dev/null; then
+  echo "share: a push to $f is already live (pid $(cat "$lock")) — two pushes on one code reject every pull. Kill it first:  kill $(cat "$lock")" >&2; exit 1
+fi
+echo $$ > "$lock"; trap 'rm -f "$lock"' EXIT
 left=$(( 86400 - $(date -u +%s) % 86400 ))
 printf 'share: [1/3] code for %s today: %s  (rotates at UTC midnight — in %dh%02dm)\n' "$f" "$CROC_SECRET" $((left/3600)) $(((left%3600)/60)) >&2
 [ "$left" -ge 2700 ] || printf 'share: ⚠ code rotates in %dm — if %s pulls after that, you will miss each other\n' $((left/60)) "$f" >&2
 printf 'share: [2/3] opening room at the relay (unclaimed rooms die after ~3h)\n' >&2
 printf 'share:       plain croc works too:  croc --yes %s\n' "$CROC_SECRET" >&2
-printf 'share: [3/3] waiting for %s to pull — transfer starts the moment they do\n' "$f" >&2
-exec croc --yes send "${p[@]}"
+printf 'share: [3/3] waiting for %s to pull — transfer starts the moment they do (one pull per push; rerun to send again)\n' "$f" >&2
+croc --yes send "${p[@]}"   # not exec — the lock trap must fire when the push ends
