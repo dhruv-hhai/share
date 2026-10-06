@@ -24,24 +24,35 @@
 set -euo pipefail
 tmp="${TMPDIR:-/tmp}"
 
+# Daemons found by process scan, one line per daemon: "PGID FRIEND ROLE". The pid
+# file is the primary record, but macOS purges $TMPDIR files untouched for ~3 days
+# (the daemon now touches its own, but older ones lost theirs) — this is the fallback.
+# pgid = the setsid leader = the pid the file would hold; sort -u folds the loop subshells.
+daemons_ps() { ps -axo pgid=,command= | sed -n 's/^ *\([0-9][0-9]*\) .*tools\/sync --fg --friend \([^ ]*\) --role \([ab]\).*$/\1 \2 \3/p' | sort -u; }
+
 case "${1:-}" in
   status)
-    found=""
+    found=""; seen=" "
     for pf in "$tmp"/share-sync-*.pid; do
       [ -f "$pf" ] || continue; found=1
-      read -r pid role dir log < "$pf"
-      name="$(basename "$pf" .pid)"; name="${name#share-sync-}"
+      read -r pid role dir _ < "$pf"
+      name="$(basename "$pf" .pid)"; name="${name#share-sync-}"; seen="$seen$name "
       if kill -0 "$pid" 2>/dev/null; then st=running; else st=stale; fi
       printf '%-12s role %s  %-8s pid %-6s %s\n' "$name" "$role" "$st" "$pid" "$dir"
     done
+    while read -r pgid name role; do
+      case "$seen" in *" $name "*) continue;; esac; found=1
+      printf '%-12s role %s  %-8s pid %-6s %s\n' "$name" "$role" running "$pgid" "(pid file lost — stop still works)"
+    done < <(daemons_ps)
     [ -n "$found" ] || echo "no sync daemons"
     exit 0;;
   stop)
     shift; f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done
     [ -n "$f" ] || { echo "usage: share sync stop --friend NAME" >&2; exit 1; }
-    pf="$tmp/share-sync-$f.pid"
-    [ -f "$pf" ] || { echo "share sync: nothing running for $f" >&2; exit 1; }
-    read -r pid _ < "$pf"
+    pf="$tmp/share-sync-$f.pid"; pid=""
+    [ ! -f "$pf" ] || read -r pid _ < "$pf"
+    [ -n "$pid" ] || pid="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
+    [ -n "$pid" ] || { echo "share sync: nothing running for $f" >&2; exit 1; }
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     rm -f "$pf" "$tmp/share-sync-$f.gitlock" 2>/dev/null; rmdir "$tmp/share-sync-$f.gitlock" 2>/dev/null || true
     echo "share sync: stopped $f (pid $pid and its tree)"
@@ -81,7 +92,9 @@ d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"
 pidf="$tmp/share-sync-$f.pid"; lg="$tmp/share-sync-$f.log"
 
 if [ -z "$fg" ]; then
-  if [ -f "$pidf" ] && read -r opid _ < "$pidf" && kill -0 "$opid" 2>/dev/null; then
+  opid=""
+  { [ -f "$pidf" ] && read -r opid _ < "$pidf" && kill -0 "$opid" 2>/dev/null; } || opid="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
+  if [ -n "$opid" ]; then
     echo "share sync: already running for $f (pid $opid) — stop it first:  share sync stop --friend $f" >&2; exit 1
   fi
   # own process group (setsid) so stop can kill the whole tree: loops, push/pull, croc
@@ -102,6 +115,7 @@ if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in
 printf '%s %s %s %s\n' "$$" "$role" "$d" "$lg" > "$pidf"
 stage="$tmp/share-sync-$f-in"; mkdir -p "$stage"
 lk="$tmp/share-sync-$f.gitlock"   # mkdir-lock serializes the two loops on one repo
+rmdir "$lk" 2>/dev/null || true    # a fresh daemon owns the repo — a lock left by a dead one must not block it
 
 log()    { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 G()      { git -C "$d" "$@"; }
@@ -115,9 +129,20 @@ fi
 # local identity so commits work with zero git setup — never touches global config
 G config user.email >/dev/null 2>&1 || { G config user.name "share-sync"; G config user.email "sync@share.local"; }
 
-commit_dirty() { G add -A; G diff --cached --quiet 2>/dev/null || G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)"; }
+# `git add` can lose the race with an editor mid-write ("short read while indexing") —
+# retry, then skip this tick. Never fatal: one bad tick must not take a loop down.
+commit_dirty() {
+  local i; for i in 1 2 3; do
+    G add -A >/dev/null 2>&1 && break
+    [ "$i" = 3 ] && { log "git add failed (file mid-write?) — skipping this tick"; return 0; }; sleep 1
+  done
+  G diff --cached --quiet 2>/dev/null || G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)" >/dev/null 2>&1 || log "git commit failed — will retry next tick"
+}
 
+# The loops run with errexit OFF: a failing git call must log and move on, not exit
+# the subshell holding the lock (which deadlocked the other loop forever).
 pusher() {
+  set +e
   bd="$tmp/share-sync-$f-out"; mkdir -p "$bd"; bf="$bd/share-sync-v1.bundle"   # payload name IS the protocol version
   while :; do
     lock; commit_dirty
@@ -134,6 +159,7 @@ pusher() {
 }
 
 puller() {
+  set +e
   while :; do
     rm -rf "$stage"; mkdir -p "$stage"
     if pull --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1; then
@@ -167,4 +193,11 @@ log "$d <-> $f (role $role, every ${every}s, git-merged)"
 pusher & pp=$!
 puller & lp=$!
 trap 'kill "$pp" "$lp" 2>/dev/null; unlock; exit 0' INT TERM
-wait
+# Supervise: both loops or none — a half-daemon looks alive but syncs nothing.
+# Touching the pid file keeps macOS's ~3-day $TMPDIR purge from blinding `status`.
+while kill -0 "$pp" 2>/dev/null && kill -0 "$lp" 2>/dev/null; do
+  touch "$pidf" 2>/dev/null || true; sleep 5
+done
+kill "$pp" "$lp" 2>/dev/null; unlock
+log "a loop died — daemon exiting (status shows it stale); see errors above and rerun: share sync --friend $f --role $role --dir $d"
+exit 1

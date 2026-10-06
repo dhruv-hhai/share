@@ -2,7 +2,7 @@
 
 Send files/folders across machines statelessly using [croc](https://github.com/schollz/croc). 
 
-Assign dedicated sharing folders with folders.
+Assign dedicated sharing folders with friends.
 
 # Installation & dependencies
 
