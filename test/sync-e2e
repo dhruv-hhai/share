@@ -34,6 +34,8 @@ until_ok 30 sh -c "git -C '$W/a' log --oneline -- offline.md | grep -q . && [ -z
 until_ok 60 bash -c "TMPDIR='$W/ta' '$share' sync check --friend bob | grep -q 'waiting-peer.*push waiting.*unsent'" || fail "waiting-peer verdict: $(A check --friend bob)"
 pass "verdict waiting-peer with push age + unsent count"
 until_ok 60 grep -q 'push reopened — waited .* > cap' "$W/ta/share-sync-bob.log" || fail "watchdog push cap"; pass "watchdog reopened a push past the cap"
+[ "$(git -C "$W/a" rev-parse refs/share/sent)" != "$(git -C "$W/a" rev-parse HEAD)" ] || fail "reopen must not count as delivered (sent == HEAD)"; pass "reopened push not marked sent"
+grep -q 'Terminated' "$W/ta/share-sync-bob.log" && fail "bash kill noise in log"; pass "no kill noise in log"
 
 # stale lock left by a dead loop is broken, not waited on forever
 mkdir -p "$W/ta/share-sync-bob.gitlock"; touch -t "$(date -v-20M +%Y%m%d%H%M 2>/dev/null || date -d '-20 min' +%Y%m%d%H%M)" "$W/ta/share-sync-bob.gitlock"
