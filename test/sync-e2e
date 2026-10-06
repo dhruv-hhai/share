@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# sync end-to-end: two daemons (alice role a, bob role b) on one machine over a local relay.
+# Covers: round trip both ways, status/check verdicts, saved-config restart, check --repair,
+# edits committed while a push is blocked, watchdog push cap, stale-lock break, loop respawn.
+# usage: CROC_RELAY=localhost:9009 test/sync-e2e [WORKDIR]     (needs croc + git; ~2-3 min)
+set -euo pipefail
+share="$(cd "$(dirname "$0")/.." && pwd)/share"
+W="${1:-$(mktemp -d)}"; mkdir -p "$W"/{a,b,ta,tb,cfg}
+export XDG_CONFIG_HOME="$W/cfg" SHARE_SECRET_ALICE=e2e-sync-secret SHARE_SECRET_BOB=e2e-sync-secret
+A() { TMPDIR="$W/ta" "$share" sync "$@"; }      # alice's machine: friend = bob, role a, dir $W/a
+B() { TMPDIR="$W/tb" "$share" sync "$@"; }      # bob's machine:   friend = alice, role b, dir $W/b
+until_ok() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" 2>/dev/null && return 0; sleep 1; done; echo "TIMEOUT after ${n}s: $*" >&2; return 1; }
+pass() { echo "  ok  $*"; }
+fail() { echo "FAIL  $*" >&2; echo "--- alice log"; cat "$W/ta/share-sync-bob.log" 2>/dev/null; echo "--- bob log"; cat "$W/tb/share-sync-alice.log" 2>/dev/null; exit 1; }
+cleanup() { A stop --friend bob >/dev/null 2>&1 || true; B stop --friend alice >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+echo "sync e2e in $W (relay ${CROC_RELAY:-default})"
+SHARE_PUSH_MAX=8 A --friend bob --role a --dir "$W/a" --every 2 >/dev/null
+B --friend alice --role b --dir "$W/b" --every 2 >/dev/null
+echo "hello from alice" > "$W/a/hi.md"
+until_ok 90 test -f "$W/b/hi.md" || fail "a→b round trip"; pass "a→b round trip"
+echo "hello from bob" > "$W/b/re.md"
+until_ok 90 test -f "$W/a/re.md" || fail "b→a round trip"; pass "b→a round trip"
+
+A status | grep -E '^bob +role a +(ok|waiting-peer) ' || fail "status verdict: $(A status)"; pass "status shows a healthy verdict"
+until_ok 30 A check --friend bob >/dev/null || fail "check exit 0 when healthy"; pass "check --friend exits 0 when healthy"
+grep -q '^a 2 ' "$W/cfg/share/sync/bob" || fail "saved config: $(cat "$W/cfg/share/sync/bob")"; pass "config saved (role every dir)"
+
+# bob offline: alice's push blocks at the relay; her edits must still get committed; the watchdog must reopen the push past the cap
+B stop --friend alice >/dev/null
+echo "written while bob is offline" > "$W/a/offline.md"
+until_ok 30 sh -c "git -C '$W/a' log --oneline -- offline.md | grep -q . && [ -z \"\$(git -C '$W/a' status --porcelain)\" ]" || fail "edit committed while push blocked"; pass "edit committed while push blocked (committer tick)"
+until_ok 60 bash -c "TMPDIR='$W/ta' '$share' sync check --friend bob | grep -q 'waiting-peer.*push waiting.*unsent'" || fail "waiting-peer verdict: $(A check --friend bob)"
+pass "verdict waiting-peer with push age + unsent count"
+until_ok 60 grep -q 'push reopened — waited .* > cap' "$W/ta/share-sync-bob.log" || fail "watchdog push cap"; pass "watchdog reopened a push past the cap"
+[ "$(git -C "$W/a" rev-parse refs/share/sent)" != "$(git -C "$W/a" rev-parse HEAD)" ] || fail "reopen must not count as delivered (sent == HEAD)"; pass "reopened push not marked sent"
+grep -q 'Terminated' "$W/ta/share-sync-bob.log" && fail "bash kill noise in log"; pass "no kill noise in log"
+
+# stale lock left by a dead loop is broken, not waited on forever
+mkdir -p "$W/ta/share-sync-bob.gitlock"; touch -t "$(date -v-20M +%Y%m%d%H%M 2>/dev/null || date -d '-20 min' +%Y%m%d%H%M)" "$W/ta/share-sync-bob.gitlock"
+until_ok 30 grep -q 'broke a stale lock' "$W/ta/share-sync-bob.log" || fail "stale lock break"; pass "stale lock broken"
+
+# a loop that dies is respawned, daemon stays up
+read -r apid _ < "$W/ta/share-sync-bob.pid"
+loop="$(pgrep -P "$apid" -f 'tools/sync' | head -1)"; kill -9 "$loop"
+until_ok 30 grep -q 'loop died — respawning' "$W/ta/share-sync-bob.log" || fail "loop respawn"; pass "dead loop respawned"
+kill -0 "$apid" || fail "daemon exited on loop death"
+
+# bob back from saved config (no --role): the queued push lands
+B --friend alice >/dev/null
+until_ok 120 test -f "$W/b/offline.md" || fail "queued push delivered after peer returns"; pass "peer restarted from saved config, queued push delivered"
+
+# restart + check --repair
+A restart --friend bob >/dev/null; sleep 1
+until_ok 30 A check --friend bob >/dev/null || fail "healthy after restart"; pass "restart from saved config"
+A stop --friend bob >/dev/null
+if A check --friend bob >/dev/null; then fail "check should exit 1 when down"; fi; pass "check exits 1 when down"
+A check --friend bob --repair | grep -q 'repaired bob' || fail "check --repair"; sleep 1
+until_ok 30 A check --friend bob >/dev/null || fail "healthy after --repair"; pass "check --repair restarted it"
+echo "sync e2e: all passed"

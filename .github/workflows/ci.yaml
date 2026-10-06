@@ -104,6 +104,11 @@ jobs:
           droppings=$(find . -name 'croc-stdin-*' | wc -l)
           [ "$droppings" -eq 0 ] || { echo "::error::croc-stdin droppings left in cwd"; exit 1; }
 
+      - name: Sync — two daemons over the local relay (round trips, health verdicts, saved-config restart, check --repair, watchdog resets)
+        env:
+          CROC_RELAY: localhost:9009
+        run: test/sync-e2e /tmp/sync-e2e
+
       - name: Dispatcher contract — help lists every tool, each tool has a header
         run: |
           set -euo pipefail

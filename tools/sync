@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # desc: continuous two-way folder sync with a friend — git-merged, nothing lost
 # usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
-#        share sync status                 every sync daemon: friend, role, pid, dir
+#        share sync --friend NAME          restart from the saved config (role/dir remembered per friend)
+#        share sync status                 every sync daemon: friend, role, health verdict, pid, dir
+#        share sync check [--friend NAME] [--repair]   health with an exit code (0 = fine); --repair restarts the sick
+#        share sync restart --friend NAME  stop + start from the saved config
 #        share sync stop --friend NAME     stop one (kills the whole process tree)
 #        share sync log --friend NAME      where the log is + last lines
 #        share sync history --friend NAME [N]   last N file changes (default 20): who, when, A/M/D per file
@@ -16,6 +19,16 @@
 # append-both (union); other conflicting files keep YOURS in place and save
 # THEIRS beside it as NAME.conflict-<timestamp> — no byte is ever dropped.
 # A stale queued push can no longer eat a local edit: merging, not overwriting.
+# Health: every wait is bounded and visible. `status`/`check` verdicts:
+#   ok            loops alive, nothing queued
+#   waiting-peer  a push is open at the relay, waiting for them to come online
+#   stuck         heartbeat stopped, lock stale, or a push older than the cap — restart it
+#   down          configured (or was running) but no daemon — `check --repair` restarts it
+# The daemon's watchdog resets what it can on its own: respawns a dead loop,
+# reopens a push older than SHARE_PUSH_MAX seconds (default 7200) or from
+# before the UTC-midnight code rotation, reconnects after a sleep/wake clock
+# jump, breaks a lock held >10 min, commits local edits on its own tick (so a
+# blocked push never holds your edits hostage). Cron:  */5 * * * * share sync check --repair
 # Protocol: the payload is a single file named share-sync-v1.bundle — anything
 # else arriving in the sync room is an incompatible peer and is refused LOUDLY
 # (both sides must run the same major version; payload changes bump the major).
@@ -23,43 +36,85 @@
 # arrive as both lines, adjacent; history grows in .git (squash if you care).
 set -euo pipefail
 tmp="${TMPDIR:-/tmp}"
+cfgd="${XDG_CONFIG_HOME:-$HOME/.config}/share/sync"   # one file per friend: "ROLE EVERY DIR" — survives reboot + $TMPDIR purge
+pmax="${SHARE_PUSH_MAX:-7200}"                        # reopen a push waiting longer than this (relay drops unclaimed rooms ~3h)
 
 # Daemons found by process scan, one line per daemon: "PGID FRIEND ROLE". The pid
 # file is the primary record, but macOS purges $TMPDIR files untouched for ~3 days
-# (the daemon now touches its own, but older ones lost theirs) — this is the fallback.
+# (the daemon touches its own, but older ones lost theirs) — this is the fallback.
 # pgid = the setsid leader = the pid the file would hold; sort -u folds the loop subshells.
 daemons_ps() { ps -axo pgid=,command= | sed -n 's/^ *\([0-9][0-9]*\) .*tools\/sync --fg --friend \([^ ]*\) --role \([ab]\).*$/\1 \2 \3/p' | sort -u; }
+mtime()      { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+ago()        { if [ "$1" -ge 3600 ]; then printf '%dh%02dm' $(($1/3600)) $(($1%3600/60)); elif [ "$1" -ge 60 ]; then printf '%dm' $(($1/60)); else printf '%ds' "$1"; fi; }
+older()      { [ -e "$1" ] && [ -n "$(find "$1" -maxdepth 0 -mmin +"$2" 2>/dev/null)" ]; }   # path, minutes
+# Every friend we know of: pid files, live processes, saved configs.
+friends_known() { { for p in "$tmp"/share-sync-*.pid; do [ -f "$p" ] && { p="$(basename "$p" .pid)"; echo "${p#share-sync-}"; }; done
+                    daemons_ps | awk '{print $2}'
+                    for c in "$cfgd"/*; do [ -f "$c" ] && basename "$c"; done; } 2>/dev/null | sort -u; }
+# info F -> pid (empty if not running), role, dir — from the pid file, falling back to ps and the saved config.
+info() { pid=""; role=""; dir=""; local pf="$tmp/share-sync-$1.pid"
+  [ ! -f "$pf" ] || read -r pid role dir _ < "$pf"
+  { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || pid="$(daemons_ps | awk -v f="$1" '$2==f{print $1; exit}')"
+  [ -n "$role" ] || { [ ! -f "$cfgd/$1" ] || read -r role _ dir < "$cfgd/$1"; }; }
+# health F -> "VERDICT<TAB>DETAIL<TAB>ROLE<TAB>DIR" (see header for the verdicts).
+health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tmp/share-sync-$f.pid"
+  if [ -z "$pid" ]; then v=down; d="not running"
+  else
+    d="pid $pid"
+    if [ -f "$pf" ] && older "$pf" 2; then v=stuck; d="$d, heartbeat $(ago $((now - $(mtime "$pf")))) old"; fi
+    if older "$tmp/share-sync-$f.gitlock" 10; then v=stuck; d="$d, lock stale $(ago $((now - $(mtime "$tmp/share-sync-$f.gitlock"))))"; fi
+    if [ -f "$tmp/share-sync-$f.push" ]; then
+      read -r age _ < "$tmp/share-sync-$f.push"; age=$((now - age)); d="$d, push waiting $(ago "$age")"
+      if [ "$age" -gt $((pmax + 300)) ]; then v=stuck; else v="${v:-waiting-peer}"; fi
+    fi
+    v="${v:-ok}"
+  fi
+  if [ -d "$dir/.git" ]; then local unsent dirty
+    unsent="$(git -C "$dir" rev-list --count refs/share/sent..HEAD 2>/dev/null || git -C "$dir" rev-list --count HEAD 2>/dev/null || echo 0)"
+    dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$unsent" = 0 ] || d="$d, unsent $unsent"; [ "$dirty" = 0 ] || d="$d, dirty $dirty"
+  fi
+  [ ! -f "$tmp/share-sync-$f.log" ] || d="$d, last event $(ago $((now - $(mtime "$tmp/share-sync-$f.log")))) ago"
+  printf "%s\t%s\t%s\t%s\n" "$v" "$d" "${role:-?}" "${dir:-?}"; }
+stop_friend() { local f="$1"; local p="" pf="$tmp/share-sync-$f.pid"
+  [ ! -f "$pf" ] || read -r p _ < "$pf"
+  [ -n "$p" ] || p="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
+  [ -n "$p" ] || { echo "share sync: nothing running for $f" >&2; return 1; }
+  kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+  rm -f "$pf" "$tmp/share-sync-$f.push" "$tmp/share-sync-$f.reset" 2>/dev/null; rmdir "$tmp/share-sync-$f.gitlock" 2>/dev/null || true
+  echo "share sync: stopped $f (pid $p and its tree)"; }
+# remember F: a daemon started before configs existed (or whose config was lost) — learn role/dir from its pid file
+remember()    { [ -f "$cfgd/$1" ] && return 0; info "$1"; { [ -n "$role" ] && [ -n "$dir" ]; } || return 1; mkdir -p "$cfgd"; printf '%s %s %s\n' "$role" 15 "$dir" > "$cfgd/$1"; }
+start_saved() { [ -f "$cfgd/$1" ] || { echo "share sync: no saved config for $1 — start it once with --role (and --dir)" >&2; return 1; }; "$0" --friend "$1"; }
+friend_arg() { f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done; [ -n "$f" ] || { echo "usage: share sync $sub --friend NAME" >&2; exit 1; }; }
 
-case "${1:-}" in
+sub="${1:-}"
+case "$sub" in
   status)
-    found=""; seen=" "
-    for pf in "$tmp"/share-sync-*.pid; do
-      [ -f "$pf" ] || continue; found=1
-      read -r pid role dir _ < "$pf"
-      name="$(basename "$pf" .pid)"; name="${name#share-sync-}"; seen="$seen$name "
-      if kill -0 "$pid" 2>/dev/null; then st=running; else st=stale; fi
-      printf '%-12s role %s  %-8s pid %-6s %s\n' "$name" "$role" "$st" "$pid" "$dir"
-    done
-    while read -r pgid name role; do
-      case "$seen" in *" $name "*) continue;; esac; found=1
-      printf '%-12s role %s  %-8s pid %-6s %s\n' "$name" "$role" running "$pgid" "(pid file lost — stop still works)"
-    done < <(daemons_ps)
+    found=""
+    while read -r f; do [ -n "$f" ] || continue; found=1
+      h="$(health "$f")"; IFS=$'\t' read -r v d r dd <<< "$h"; printf '%-12s role %s  %-13s %s  %s\n' "$f" "$r" "$v" "$d" "$dd"
+    done < <(friends_known)
     [ -n "$found" ] || echo "no sync daemons"
     exit 0;;
+  check)
+    shift; f=""; repair=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; --repair) repair=1; shift;; *) shift;; esac; done
+    bad=0
+    while read -r n; do [ -n "$n" ] || continue
+      h="$(health "$n")"; IFS=$'\t' read -r v d _ _ <<< "$h"; printf '%-12s %-13s %s\n' "$n" "$v" "$d"
+      case "$v" in ok|waiting-peer) continue;; esac
+      if [ -n "$repair" ]; then
+        remember "$n" || true; [ "$v" = down ] || stop_friend "$n" || true
+        if start_saved "$n"; then echo "share sync: repaired $n"; else bad=1; fi
+      else bad=1; fi
+    done < <(if [ -n "$f" ]; then echo "$f"; else friends_known; fi)
+    exit "$bad";;
+  restart)
+    shift; friend_arg "$@"; remember "$f" || true; stop_friend "$f" || true; sleep 0.5; exec "$0" --friend "$f";;
   stop)
-    shift; f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done
-    [ -n "$f" ] || { echo "usage: share sync stop --friend NAME" >&2; exit 1; }
-    pf="$tmp/share-sync-$f.pid"; pid=""
-    [ ! -f "$pf" ] || read -r pid _ < "$pf"
-    [ -n "$pid" ] || pid="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
-    [ -n "$pid" ] || { echo "share sync: nothing running for $f" >&2; exit 1; }
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    rm -f "$pf" "$tmp/share-sync-$f.gitlock" 2>/dev/null; rmdir "$tmp/share-sync-$f.gitlock" 2>/dev/null || true
-    echo "share sync: stopped $f (pid $pid and its tree)"
-    exit 0;;
+    shift; friend_arg "$@"; stop_friend "$f"; exit $?;;
   log)
-    shift; f=""; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; *) shift;; esac; done
-    [ -n "$f" ] || { echo "usage: share sync log --friend NAME" >&2; exit 1; }
+    shift; friend_arg "$@"
     lg="$tmp/share-sync-$f.log"
     [ -f "$lg" ] || { echo "share sync: no log for $f" >&2; exit 1; }
     echo "$lg"; tail -20 "$lg"
@@ -67,16 +122,14 @@ case "${1:-}" in
   history)
     shift; f=""; n=20; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; [0-9]*) n="$1"; shift;; *) shift;; esac; done
     [ -n "$f" ] || { echo "usage: share sync history --friend NAME [N]" >&2; exit 1; }
-    hd=""; pf="$tmp/share-sync-$f.pid"
-    [ -f "$pf" ] && read -r _ _ hd _ < "$pf"
-    [ -n "$hd" ] || hd="${SHARE_PULL_DIR:-$HOME/share}/$f"
+    info "$f"; hd="${dir:-${SHARE_PULL_DIR:-$HOME/share}/$f}"
     [ -d "$hd/.git" ] || { echo "share sync: no sync history at $hd" >&2; exit 1; }
     # mine = commits made here; theirs arrive inside merge commits — --first-parent keeps the local timeline
     git -C "$hd" log -"$n" --date=format:'%m-%d %H:%M' --pretty='%ad  %s' --name-status | sed '/^$/d'
     exit 0;;
 esac
 
-f=""; role=""; d=""; every=15; fg=""
+f=""; role=""; d=""; every=""; fg=""
 while [ $# -gt 0 ]; do case "$1" in
   --friend|-f) f="${2:?}"; shift 2;;
   --role|-r)   role="${2:?}"; shift 2;;
@@ -85,15 +138,19 @@ while [ $# -gt 0 ]; do case "$1" in
   --fg)        fg=1; shift;;
   *) shift;;
 esac; done
-{ [ -n "$f" ] && { [ "$role" = a ] || [ "$role" = b ]; }; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]" >&2; exit 1; }
+[ -n "$f" ] || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]" >&2; exit 1; }
+# no --role: resume from the saved config (what `restart` and `check --repair` use)
+if [ -z "$role" ] && [ -f "$cfgd/$f" ]; then read -r srole severy sdir < "$cfgd/$f"; role="$srole"; d="${d:-$sdir}"; every="${every:-$severy}"; fi
+{ [ "$role" = a ] || [ "$role" = b ]; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]   (no saved config for $f yet)" >&2; exit 1; }
+every="${every:-15}"
 command -v git >/dev/null || { echo "share sync: needs the git binary (no account or remote — local repo only). macOS: xcode-select --install" >&2; exit 1; }
 code -f "$f" >/dev/null   # fail on unknown friend BEFORE daemonizing
 d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"
 pidf="$tmp/share-sync-$f.pid"; lg="$tmp/share-sync-$f.log"
+mkdir -p "$cfgd"; printf '%s %s %s\n' "$role" "$every" "$d" > "$cfgd/$f"
 
 if [ -z "$fg" ]; then
-  opid=""
-  { [ -f "$pidf" ] && read -r opid _ < "$pidf" && kill -0 "$opid" 2>/dev/null; } || opid="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
+  info "$f"; opid="$pid"
   if [ -n "$opid" ]; then
     echo "share sync: already running for $f (pid $opid) — stop it first:  share sync stop --friend $f" >&2; exit 1
   fi
@@ -105,8 +162,8 @@ if [ -z "$fg" ]; then
   pid=$!
   printf '%s %s %s %s\n' "$pid" "$role" "$d" "$lg" > "$pidf"
   echo "share sync: $f (role $role) syncing $d in the background (pid $pid)"
-  echo "share sync:   log:  share sync log --friend $f"
-  echo "share sync:   stop: share sync stop --friend $f"
+  echo "share sync:   log:    share sync log --friend $f"
+  echo "share sync:   health: share sync check --friend $f      stop: share sync stop --friend $f"
   exit 0
 fi
 
@@ -114,13 +171,22 @@ fi
 if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in_="sync-a2b"; fi
 printf '%s %s %s %s\n' "$$" "$role" "$d" "$lg" > "$pidf"
 stage="$tmp/share-sync-$f-in"; mkdir -p "$stage"
-lk="$tmp/share-sync-$f.gitlock"   # mkdir-lock serializes the two loops on one repo
-rmdir "$lk" 2>/dev/null || true    # a fresh daemon owns the repo — a lock left by a dead one must not block it
+lk="$tmp/share-sync-$f.gitlock"   # mkdir-lock serializes the loops on one repo
+pushf="$tmp/share-sync-$f.push"   # "EPOCH HEAD UTCDAY" while a push is open at the relay — what status/watchdog read
+resetf="$tmp/share-sync-$f.reset" # watchdog leaves its reason here when it kills a push; the pusher reports it
+rmdir "$lk" 2>/dev/null || true; rm -f "$pushf" "$resetf"   # a fresh daemon owns the repo — leftovers of a dead one must not block it
 
 log()    { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 G()      { git -C "$d" "$@"; }
-lock()   { until mkdir "$lk" 2>/dev/null; do sleep 0.2; done; }
+# A lock held >10 min is a corpse (a loop killed mid-critical-section) — break it rather than hang every loop forever.
+lock()   { until mkdir "$lk" 2>/dev/null; do ! older "$lk" 10 || { rmdir "$lk" 2>/dev/null && log "broke a stale lock (held >10m)"; }; sleep 0.2; done; }
 unlock() { rmdir "$lk" 2>/dev/null || true; }
+# Top-down kill: the parent first (collect its kids before — they reparent to 1 once it dies), then the kids.
+# Parent-first matters: croc exits 0 on SIGTERM, and a push whose croc "succeeded" would be taken as delivered.
+kill_tree() { local c kids; kids="$(pgrep -P "$1" 2>/dev/null || true)"; kill "$1" 2>/dev/null || true; for c in $kids; do kill_tree "$c"; done; }
+# push/pull run under a throwaway `bash -c` wrapper whose stderr is /dev/null: killing the wrapper's subtree (push + croc)
+# gives the loop a plain exit status, and bash's "Terminated" report lands in the wrapper, not in the log.
+kill_grandkids() { local w c; for w in $(pgrep -P "$1" 2>/dev/null); do for c in $(pgrep -P "$w" 2>/dev/null); do kill_tree "$c"; done; done; }
 
 if [ ! -d "$d/.git" ]; then
   git init -q "$d"
@@ -150,19 +216,27 @@ pusher() {
     sent="$(G rev-parse -q --verify refs/share/sent 2>/dev/null || true)"
     if [ -n "$head" ] && [ "$head" != "$sent" ]; then
       G bundle create "$bf" HEAD >/dev/null 2>&1; unlock
-      # blocks until they pull — that block is the delivery ack
-      if push --friend "$f" --salt "$out" "$bf" >/dev/null 2>&1; then
-        lock; G update-ref refs/share/sent "$head"; unlock; log "pushed ${head:0:7}"
-      else log "push failed — retrying in ${every}s"; sleep "$every"; fi
+      printf '%s %s %s\n' "$(date +%s)" "$head" "$(date -u +%F)" > "$pushf"
+      # blocks until they pull — that block is the delivery ack (the watchdog bounds it: see pmax).
+      # Wrapper + wait: a watchdog kill is a plain exit status (see kill_grandkids). A reset flag outranks
+      # an exit 0 — croc exits 0 when killed, and that must never count as delivered.
+      bash -c 'push "$@"; exit $?' _ --friend "$f" --salt "$out" "$bf" >/dev/null 2>&1 &
+      if wait "$!" && [ ! -f "$resetf" ]; then
+        rm -f "$pushf"; lock; G update-ref refs/share/sent "$head"; unlock; log "pushed ${head:0:7}"
+      elif [ -f "$resetf" ]; then rm -f "$pushf"; log "push reopened — $(cat "$resetf")"; rm -f "$resetf"
+      else rm -f "$pushf"; log "push failed — retrying in ${every}s"; sleep "$every"; fi
     else unlock; sleep "$every"; fi
   done
 }
 
 puller() {
   set +e
+  pfail=""
   while :; do
     rm -rf "$stage"; mkdir -p "$stage"
-    if pull --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1; then
+    bash -c 'pull "$@"; exit $?' _ --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1 &
+    if wait "$!"; then
+      [ -z "$pfail" ] || { log "pull recovered"; pfail=""; }
       bundle="$stage/share-sync-v1.bundle"
       if [ ! -f "$bundle" ]; then
         log "INCOMPATIBLE PEER — $f sent $(ls "$stage" | head -3 | paste -sd, -) instead of share-sync-v1.bundle; both sides must run the same major version: brew upgrade share"
@@ -185,19 +259,41 @@ puller() {
         log "merged with conflict copies"
       fi
       unlock
-    else sleep "$every"; fi
+    else
+      # pull fails hard only when croc itself fails (relay unreachable, bad binary) — say so once, not every tick
+      [ -n "$pfail" ] || { log "pull failed — retrying every ${every}s, quietly (relay unreachable? peer mid-restart?)"; pfail=1; }
+      sleep "$every"
+    fi
   done
 }
 
-log "$d <-> $f (role $role, every ${every}s, git-merged)"
+# Watchdog (runs in the supervisor, every 5s): what `check` would restart the daemon for, fixed in place.
+#   - a push open longer than pmax, or opened before the UTC-midnight code rotation, is killed → pusher reopens it
+#   - a clock jump (laptop slept) → kill in-flight push/pull so croc reconnects instead of trusting a dead socket
+#   - the pid-file touch is the heartbeat `status` reads; the commit tick keeps edits flowing while a push blocks
+reset_push() { [ -f "$pushf" ] || return 0; echo "$1" > "$resetf"; kill_grandkids "$pp"; }
+watch() {
+  local now pt pday age
+  now="$(date +%s)"
+  if [ $((now - last)) -gt 90 ]; then log "clock jumped $(ago $((now - last))) (sleep/wake?) — reconnecting"; reset_push "clock jumped (sleep/wake)"; kill_grandkids "$lp"; fi
+  last="$now"
+  if [ -f "$pushf" ] && read -r pt _ pday < "$pushf"; then
+    age=$((now - pt))
+    if [ "$age" -gt "$pmax" ]; then reset_push "waited $(ago "$age") > cap $(ago "$pmax") (relay drops unclaimed rooms ~3h)"
+    elif [ "$pday" != "$(date -u +%F)" ]; then reset_push "code rotated at UTC midnight while waiting $(ago "$age")"; fi
+  fi
+  if [ $((now - lastc)) -ge "$every" ]; then lock; commit_dirty; unlock; lastc="$now"; fi
+  touch "$pidf" 2>/dev/null || true
+}
+
+log "$d <-> $f (role $role, every ${every}s, git-merged, push cap $(ago "$pmax"))"
 pusher & pp=$!
 puller & lp=$!
 trap 'kill "$pp" "$lp" 2>/dev/null; unlock; exit 0' INT TERM
-# Supervise: both loops or none — a half-daemon looks alive but syncs nothing.
-# Touching the pid file keeps macOS's ~3-day $TMPDIR purge from blinding `status`.
-while kill -0 "$pp" 2>/dev/null && kill -0 "$lp" 2>/dev/null; do
-  touch "$pidf" 2>/dev/null || true; sleep 5
+set +e   # the supervisor must outlive any failing check
+last="$(date +%s)"; lastc="$last"
+while :; do
+  kill -0 "$pp" 2>/dev/null || { log "push loop died — respawning"; pusher & pp=$!; }
+  kill -0 "$lp" 2>/dev/null || { log "pull loop died — respawning"; puller & lp=$!; }
+  watch; sleep 5
 done
-kill "$pp" "$lp" 2>/dev/null; unlock
-log "a loop died — daemon exiting (status shows it stale); see errors above and rerun: share sync --friend $f --role $role --dir $d"
-exit 1

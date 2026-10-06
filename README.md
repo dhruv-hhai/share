@@ -67,12 +67,16 @@ Keep one folder mirrored between two machines, continuously — picking up where
    ```
 3. Manage it:
    ```sh
-   share sync status                  # every daemon: friend, role, pid, dir
-   share sync log --friend bob        # daemon log: pushes/pulls as they happen
+   share sync status                  # every daemon: friend, role, health verdict, pid, dir
+   share sync check [--friend bob]    # same, with an exit code (0 = fine) — cron it; --repair restarts the sick
+   share sync restart --friend bob    # stop + start from the saved config (role/dir remembered per friend)
+   share sync log --friend bob        # daemon log: pushes/pulls/resets as they happen
    share sync history --friend bob    # file-level audit: who, when, A/M/D per file
    share sync stop --friend bob       # kills the whole tree, croc included
    ```
-   `--fg` runs it in the foreground instead (debugging). Daemons don't survive a reboot — rerun sync (or add it to cron/launchd).
+   `--fg` runs it in the foreground instead (debugging). Daemons don't survive a reboot, but the config does: `share sync --friend bob` (no `--role`) brings one back, and `*/5 * * * * share sync check --repair` in cron brings them all back.
+
+   **Health.** Verdicts are `ok`, `waiting-peer` (a push is open at the relay until they come online — normal), `stuck` (heartbeat stopped, stale lock, or a push far past its cap — restart it), `down` (configured but not running). The daemon's own watchdog fixes what it can in place: respawns a dead loop, reopens a push waiting longer than `SHARE_PUSH_MAX` seconds (default 7200 — relays drop unclaimed rooms after ~3h) or one opened before the UTC-midnight code rotation, reconnects after a sleep/wake clock jump, breaks a lock held over 10 minutes, and commits your edits on its own tick so a blocked push never holds them hostage. Every reset is a log line.
 
 Under the hood each side keeps a **local git repo** in the folder — the git *binary* only, no account, no remote, no network git; what travels over the relay is a git bundle. That buys real sync semantics:
 - **nothing is ever dropped** — edits are committed before any merge, so a stale incoming copy can't overwrite your work
@@ -89,7 +93,8 @@ share push --friend NAME PATH...   send (blocks until they pull)
 share pull --friend NAME [--dest]  receive (default ~/share/NAME; base movable via SHARE_PULL_DIR)
 share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
                                    two-way folder sync daemon (roles: one side a, other b)
-share sync status|stop|log|history manage sync daemons; history = per-file audit trail
+share sync status|check|restart|stop|log|history
+                                   manage sync daemons; check = health + exit code (--repair fixes); history = per-file audit
 share friends                      who you can share with
 share friends invite NAME          pair: prints a one-time code to tell them
 share friends accept NAME CODE     other side of a pairing
@@ -113,6 +118,7 @@ tools/pull       receive from a friend
 tools/push       send paths to a friend
 tools/sync       continuous two-way folder sync — composes push/pull on salted rooms
 tools/tutorial   guided tour; real push/pull with yourself in a sandbox
+test/sync-e2e    two daemons over a local relay: round trips, verdicts, repair, watchdog resets (CI runs it)
 ```
 
 Add a capability: drop an executable in `tools/` with a `# desc:` line. MIT.
