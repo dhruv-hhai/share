@@ -7,12 +7,14 @@ set -euo pipefail
 share="$(cd "$(dirname "$0")/.." && pwd)/share"
 W="${1:-$(mktemp -d)}"; mkdir -p "$W"/{a,b,ta,tb,cfg}
 export XDG_CONFIG_HOME="$W/cfg" SHARE_SECRET_ALICE=e2e-sync-secret SHARE_SECRET_BOB=e2e-sync-secret
+export SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EVERY=2   # no network/brew from the daemons; version-follow every 2s instead of 60
+repo="$(cd "$(dirname "$0")/.." && pwd)"; e2etag="v99.99.99-e2e"
 A() { TMPDIR="$W/ta" "$share" sync "$@"; }      # alice's machine: friend = bob, role a, dir $W/a
 B() { TMPDIR="$W/tb" "$share" sync "$@"; }      # bob's machine:   friend = alice, role b, dir $W/b
 until_ok() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" 2>/dev/null && return 0; sleep 1; done; echo "TIMEOUT after ${n}s: $*" >&2; return 1; }
 pass() { echo "  ok  $*"; }
 fail() { echo "FAIL  $*" >&2; echo "--- alice log"; cat "$W/ta/share-sync-bob.log" 2>/dev/null; echo "--- bob log"; cat "$W/tb/share-sync-alice.log" 2>/dev/null; exit 1; }
-cleanup() { A stop --friend bob >/dev/null 2>&1 || true; B stop --friend alice >/dev/null 2>&1 || true; }
+cleanup() { A stop --friend bob >/dev/null 2>&1 || true; B stop --friend alice >/dev/null 2>&1 || true; git -C "$repo" tag -d "$e2etag" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "sync e2e in $W (relay ${CROC_RELAY:-default})"
@@ -58,4 +60,11 @@ A stop --friend bob >/dev/null
 if A check --friend bob >/dev/null; then fail "check should exit 1 when down"; fi; pass "check exits 1 when down"
 A check --friend bob --repair | grep -q 'repaired bob' || fail "check --repair"; sleep 1
 until_ok 30 A check --friend bob >/dev/null || fail "healthy after --repair"; pass "check --repair restarted it"
+# the installed version changes under a running daemon (git install: a new tag) → it re-execs onto it, same pid
+read -r apid _ < "$W/ta/share-sync-bob.pid"
+git -C "$repo" tag "$e2etag" >/dev/null
+until_ok 30 grep -q 're-exec onto the installed version' "$W/ta/share-sync-bob.log" || fail "version follow re-exec"; pass "daemon re-execs when installed version changes"
+sleep 2; read -r apid2 _ < "$W/ta/share-sync-bob.pid"; [ "$apid" = "$apid2" ] || fail "re-exec changed the pid ($apid -> $apid2)"; pass "re-exec keeps the pid"
+until_ok 30 A check --friend bob >/dev/null || fail "healthy after re-exec"; pass "healthy after re-exec"
+grep -q "share 99.99.99-e2e" "$W/ta/share-sync-bob.log" || fail "new daemon did not report the new version"; pass "new version reported in log"
 echo "sync e2e: all passed"

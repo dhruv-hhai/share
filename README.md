@@ -100,11 +100,16 @@ share friends invite NAME          pair: prints a one-time code to tell them
 share friends accept NAME CODE     other side of a pairing
 share friends add NAME [SECRET]    register by hand
 share code --friend NAME [--salt]  today's code, for debugging (salt = named room, used by sync)
+share update [--check|--installed] same-major self-update (runs daily on its own; see Updates)
 ```
 
 Every step prints its gates: today's code (also usable as plain `croc <code>`), how long the relay holds an unclaimed room (~3h), and when the code rotates (UTC midnight — with a warning if that's imminent).
 
-Every command takes `--help`. The brew install checks for updates once a day and nudges `brew upgrade share`.
+Every command takes `--help`.
+
+## Updates
+
+`share` updates itself. Once a day (on any command, and from inside each sync daemon) it looks at the newest tag on GitHub and, if it is the **same major version**, applies it in the background — `brew upgrade share` for the brew install, `git pull` for the curl install. Running sync daemons re-exec onto the new version within a minute, same pid, nothing lost. A **major** bump is never applied automatically: it changes the sync payload, so both sides upgrade together by hand — the daily check just says so. `share update --check` shows where you stand, `share update` applies now, `SHARE_AUTO_UPDATE=0` opts out.
 
 State on disk, in full: one `export SHARE_SECRET_<NAME>=…` line per friend in your shell rc, and the files you pull. (croc itself keeps two small cache files in `~/.config/croc` — relay choice and version check.)
 
@@ -118,6 +123,7 @@ tools/pull       receive from a friend
 tools/push       send paths to a friend
 tools/sync       continuous two-way folder sync — composes push/pull on salted rooms
 tools/tutorial   guided tour; real push/pull with yourself in a sandbox
+tools/update     same-major self-update; latest = newest tag on GitHub; daemons re-exec to follow it
 test/sync-e2e    two daemons over a local relay: round trips, verdicts, repair, watchdog resets (CI runs it)
 ```
 

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# desc: check for a newer release; apply it when it is the same major version
+# usage: share update              apply a same-major update now (brew upgrade / git pull); a major bump only nudges
+#        share update --check      installed vs latest (exit 0 = current, 1 = update available)
+#        share update --installed  print the installed version — what a fresh `share` runs
+#        share update --auto       quiet form the dispatcher and sync daemons call: at most one check a day, applies a
+#                                  same-major update, logs to $TMPDIR/share-update.log; exit 0 only when it applied one
+# Latest = highest v* tag on github.com/dhruv-hhai/share (git ls-remote: no `brew update` round trip, one truth for
+# brew and git installs). Same major only — a major bump changes the sync payload, so both sides move together, by
+# hand. Running sync daemons follow an update on their own (they re-exec when the installed version changes).
+# SHARE_AUTO_UPDATE=0 turns --auto off.
+set -euo pipefail
+T="$(cd "$(dirname "$0")" && pwd)"; tmp="${TMPDIR:-/tmp}"
+repo="https://github.com/dhruv-hhai/share"
+kind()      { case "$T" in */Cellar/share/*) echo brew;; *) if [ -e "$T/../.git" ]; then echo git; else echo other; fi;; esac; }
+installed() { case "$(kind)" in
+  brew) readlink -f "${T%%/Cellar/share/*}/opt/share/libexec/share" | sed -n 's#.*/Cellar/share/\([^/]*\)/.*#\1#p';;   # the LINKED version (opt/share), not the running one
+  git)  git -C "$T/.." describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' | grep . || echo 0.0.0-dev;;
+  *)    echo 0.0.0-unknown;; esac; }
+latest()    { git ls-remote --tags --refs "$repo" 2>/dev/null | sed -n 's#.*refs/tags/v##p' | sort -V | tail -1; }
+newer()     { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }   # newer CUR LATEST
+apply()     { case "$(kind)" in
+  brew) brew update --quiet >/dev/null 2>&1 || true; brew upgrade share;;   # update first: the tap may not have been refreshed today
+  git)  git -C "$T/.." pull -q --ff-only;;
+  *)    echo "share: not a brew or git install — update by hand" >&2; return 1;; esac; }
+how()       { case "$(kind)" in brew) echo "brew upgrade share";; *) echo "git -C $(cd "$T/.." && pwd) pull";; esac; }
+
+mode="${1:-}"
+case "$mode" in
+  --installed) installed; exit 0;;
+  --auto)
+    [ "${SHARE_AUTO_UPDATE:-1}" != 0 ] || exit 1
+    [ "$(kind)" != other ] || exit 1
+    st="$tmp/share-upd"; [ -z "$(find "$st" -mtime -1 2>/dev/null)" ] || exit 1; touch "$st"
+    exec >>"$tmp/share-update.log" 2>&1; echo "share update: $(date +%FT%T) daily check";;
+esac
+cur="$(installed)"; new="$(latest)"
+[ -n "$new" ] || { echo "share: could not reach $repo to check for updates" >&2; exit 2; }
+if ! newer "$cur" "$new"; then echo "share $cur is current (latest v$new)"; [ "$mode" = --auto ] && exit 1; exit 0; fi
+if [ "${cur%%.*}" != "${new%%.*}" ]; then
+  echo "share v$new available — a MAJOR bump from $cur: the sync payload changes, so upgrade both sides together:  $(how)" >&2; exit 1
+fi
+[ "$mode" != --check ] || { echo "share v$new available (installed $cur, same major) — apply:  share update"; exit 1; }
+echo "share: updating $cur -> $new ($(how))"
+apply
+post="$(installed)"
+[ "$post" = "$new" ] || { echo "share: installed $post after update, expected $new — the formula may not have landed yet; retrying tomorrow" >&2; exit 1; }
+echo "share: updated to $new — running sync daemons re-exec onto it within a minute (share sync status)"

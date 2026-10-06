@@ -109,6 +109,13 @@ jobs:
           CROC_RELAY: localhost:9009
         run: test/sync-e2e /tmp/sync-e2e
 
+      - name: Update — --installed prints a version, --check reaches GitHub and exits 0/1
+        run: |
+          set -euo pipefail
+          v="$(./share update --installed)"; [ -n "$v" ] || { echo "::error::no installed version"; exit 1; }
+          ./share update --check && rc=0 || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 1 ] || { echo "::error::update --check exit $rc"; exit 1; }
+
       - name: Dispatcher contract — help lists every tool, each tool has a header
         run: |
           set -euo pipefail
