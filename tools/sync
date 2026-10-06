@@ -267,6 +267,20 @@ puller() {
   done
 }
 
+# Follow the install: `update --auto` (daily, backgrounded) applies same-major releases; whenever the installed version
+# stops matching the one running — auto or manual upgrade, either side — re-exec onto it (same pid, same pid file).
+# Resolved from our own install tree, never $PATH (a dev checkout must not follow a brew install, or vice versa):
+# brew → the stable opt/share link (cleanup deletes the old Cellar tree under our feet); otherwise the dispatcher beside tools/.
+case "$0" in */Cellar/share/*) sharebin="${0%%/Cellar/share/*}/opt/share/libexec/share";; *) sharebin="$(cd "$(dirname "$0")/.." && pwd)/share";; esac
+ver="$("$sharebin" update --installed 2>/dev/null || true)"
+follow() {
+  local iv; iv="$("$sharebin" update --installed 2>/dev/null || true)"
+  { [ -n "$iv" ] && [ "$iv" != "$ver" ]; } || return 0
+  log "installed share $iv, running $ver — re-exec onto the installed version"
+  kill "$pp" "$lp" 2>/dev/null; unlock
+  exec "$sharebin" sync --fg --friend "$f" --role "$role" --dir "$d" --every "$every"
+}
+
 # Watchdog (runs in the supervisor, every 5s): what `check` would restart the daemon for, fixed in place.
 #   - a push open longer than pmax, or opened before the UTC-midnight code rotation, is killed → pusher reopens it
 #   - a clock jump (laptop slept) → kill in-flight push/pull so croc reconnects instead of trusting a dead socket
@@ -283,15 +297,17 @@ watch() {
     elif [ "$pday" != "$(date -u +%F)" ]; then reset_push "code rotated at UTC midnight while waiting $(ago "$age")"; fi
   fi
   if [ $((now - lastc)) -ge "$every" ]; then lock; commit_dirty; unlock; lastc="$now"; fi
+  if [ $((now - lastu)) -ge 86400 ]; then "$sharebin" update --auto >/dev/null 2>&1 & lastu="$now"; fi
+  if [ $((now - lastv)) -ge "${SHARE_FOLLOW_EVERY:-60}" ]; then lastv="$now"; follow; fi
   touch "$pidf" 2>/dev/null || true
 }
 
-log "$d <-> $f (role $role, every ${every}s, git-merged, push cap $(ago "$pmax"))"
+log "$d <-> $f (role $role, every ${every}s, git-merged, push cap $(ago "$pmax"), share ${ver:-?})"
 pusher & pp=$!
 puller & lp=$!
 trap 'kill "$pp" "$lp" 2>/dev/null; unlock; exit 0' INT TERM
 set +e   # the supervisor must outlive any failing check
-last="$(date +%s)"; lastc="$last"
+last="$(date +%s)"; lastc="$last"; lastv="$last"; lastu=0
 while :; do
   kill -0 "$pp" 2>/dev/null || { log "push loop died — respawning"; pusher & pp=$!; }
   kill -0 "$lp" 2>/dev/null || { log "pull loop died — respawning"; puller & lp=$!; }
