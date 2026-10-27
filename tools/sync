@@ -86,8 +86,9 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
     dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     [ "$unsent" = 0 ] || d="$d, unsent $unsent"; [ "$dirty" = 0 ] || d="$d, dirty $dirty"
     local dpct dfree; read -r dpct dfree < <(df -Pk "$dir" 2>/dev/null | awk 'NR==2{sub("%","",$5); print $5, int($4/1024)}')
-    if [ "${dpct:-0}" -ge 90 ] || [ "${dfree:-999999}" -lt "${SHARE_DISK_RESERVE_MB:-1024}" ]; then d="$d, DISK LOW ${dpct}% used ${dfree}MB free"
-    elif [ "${dpct:-0}" -ge 80 ]; then d="$d, disk ${dpct}% used"; fi
+    # loud only on free space (what the fence uses): APFS reports purgeable space as used, so a percentage alone misleads
+    if [ "${dfree:-999999}" -lt "${SHARE_DISK_RESERVE_MB:-1024}" ]; then d="$d, DISK LOW ${dfree}MB free (${dpct}% used)"
+    elif [ "${dpct:-0}" -ge 80 ]; then d="$d, disk ${dpct}% used ${dfree}MB free"; fi
   fi
   [ ! -f "$tmp/share-sync-$f.log" ] || d="$d, last event $(ago $((now - $(mtime "$tmp/share-sync-$f.log")))) ago"
   printf "%s\t%s\t%s\t%s\n" "$v" "$d" "${role:-?}" "${dir:-?}"; }
