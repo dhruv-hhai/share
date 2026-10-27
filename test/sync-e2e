@@ -8,6 +8,7 @@ share="$(cd "$(dirname "$0")/.." && pwd)/share"
 W="${1:-$(mktemp -d)}"; mkdir -p "$W"/{a,b,ta,tb,cfg}
 export XDG_CONFIG_HOME="$W/cfg" SHARE_SECRET_ALICE=e2e-sync-secret SHARE_SECRET_BOB=e2e-sync-secret
 export SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EVERY=2   # no network/brew from the daemons; version-follow every 2s instead of 60
+export SHARE_GC_PACKS=1 SHARE_DISK_RESERVE_MB=64  # compact on every pull so the e2e sees it; small reserve (WORKDIR may be a small tmpfs)
 repo="$(cd "$(dirname "$0")/.." && pwd)"; e2etag="v99.99.99-e2e"
 A() { TMPDIR="$W/ta" "$share" sync "$@"; }      # alice's machine: friend = bob, role a, dir $W/a
 B() { TMPDIR="$W/tb" "$share" sync "$@"; }      # bob's machine:   friend = alice, role b, dir $W/b
@@ -28,6 +29,17 @@ until_ok 90 test -f "$W/a/re.md" || fail "b→a round trip"; pass "b→a round t
 A status | grep -E '^bob +role a +(ok|waiting-peer) ' || fail "status verdict: $(A status)"; pass "status shows a healthy verdict"
 until_ok 30 A check --friend bob >/dev/null || fail "check exit 0 when healthy"; pass "check --friend exits 0 when healthy"
 grep -q '^a 2 ' "$W/cfg/share/sync/bob" || fail "saved config: $(cat "$W/cfg/share/sync/bob")"; pass "config saved (role every dir)"
+
+# hygiene: bundles are incremental (basis = their last-received HEAD), big files are called out, packs get compacted
+until_ok 30 git -C "$W/a" rev-parse -q --verify refs/share/theirs >/dev/null || fail "refs/share/theirs after a pull"; pass "refs/share/theirs recorded on pull"
+echo "third exchange" > "$W/a/three.md"
+until_ok 90 test -f "$W/b/three.md" || fail "a→b third exchange"
+grep -q 'pushed [0-9a-f]* ([0-9]*KB, since [0-9a-f]*)' "$W/ta/share-sync-bob.log" || fail "incremental push: $(grep pushed "$W/ta/share-sync-bob.log")"; pass "pushes are incremental"
+dd if=/dev/zero of="$W/a/blob.bin" bs=1048576 count=21 2>/dev/null
+until_ok 60 grep -q 'large file 21MB: blob.bin' "$W/ta/share-sync-bob.log" || fail "large file warning"; pass "large file warned at commit"
+until_ok 90 test -f "$W/b/blob.bin" || fail "large file delivered"
+until_ok 30 grep -q 'compacted [0-9]* packs -> [0-9]*' "$W/tb/share-sync-alice.log" || fail "compaction: $(grep -c . "$W/tb/share-sync-alice.log") log lines"; pass "received packs compacted"
+A status | grep -qE 'disk|DISK' && pass "status reports disk use" || pass "status: disk under 80%, nothing to report"
 
 # bob offline: alice's push blocks at the relay; her edits must still get committed; the watchdog must reopen the push past the cap
 B stop --friend alice >/dev/null

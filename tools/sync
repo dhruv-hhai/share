@@ -32,6 +32,18 @@
 # Protocol: the payload is a single file named share-sync-v1.bundle — anything
 # else arriving in the sync room is an incompatible peer and is refused LOUDLY
 # (both sides must run the same major version; payload changes bump the major).
+# Transfer is incremental: a bundle carries only commits the peer lacks, judged
+# by refs/share/theirs (their HEAD as last received). Their own history is the
+# bundle's basis, so prerequisites are always present on their side; a bundle
+# they could not apply (disk full, bad transfer) is simply re-covered by our next
+# one, because refs/share/theirs only advances when THEY send US something.
+# Hygiene (what a big object store does for you, done here): every received
+# bundle is followed by `git gc --auto` with a low pack limit (gc.autoPackLimit,
+# default 8), so the repo never balloons into dozens of identical packs; a pull
+# whose bundle would not fit in the free space (3x its size + SHARE_DISK_RESERVE_MB,
+# default 1024) is skipped with a loud DISK LOW line and re-covered later; a commit
+# that adds a file over SHARE_BIG_MB (default 20) is logged — binaries carry no
+# deltas and every peer keeps every version. `status` reports disk use.
 # CAVEATS: union merge is line-based — simultaneous edits to the same line
 # arrive as both lines, adjacent; history grows in .git (squash if you care).
 set -euo pipefail
@@ -73,6 +85,9 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
     unsent="$(git -C "$dir" rev-list --count refs/share/sent..HEAD 2>/dev/null || git -C "$dir" rev-list --count HEAD 2>/dev/null || echo 0)"
     dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     [ "$unsent" = 0 ] || d="$d, unsent $unsent"; [ "$dirty" = 0 ] || d="$d, dirty $dirty"
+    local dpct dfree; read -r dpct dfree < <(df -Pk "$dir" 2>/dev/null | awk 'NR==2{sub("%","",$5); print $5, int($4/1024)}')
+    if [ "${dpct:-0}" -ge 90 ] || [ "${dfree:-999999}" -lt "${SHARE_DISK_RESERVE_MB:-1024}" ]; then d="$d, DISK LOW ${dpct}% used ${dfree}MB free"
+    elif [ "${dpct:-0}" -ge 80 ]; then d="$d, disk ${dpct}% used"; fi
   fi
   [ ! -f "$tmp/share-sync-$f.log" ] || d="$d, last event $(ago $((now - $(mtime "$tmp/share-sync-$f.log")))) ago"
   printf "%s\t%s\t%s\t%s\n" "$v" "$d" "${role:-?}" "${dir:-?}"; }
@@ -194,6 +209,11 @@ if [ ! -d "$d/.git" ]; then
 fi
 # local identity so commits work with zero git setup — never touches global config
 G config user.email >/dev/null 2>&1 || { G config user.name "share-sync"; G config user.email "sync@share.local"; }
+# compaction policy: consolidate early (default git waits for 50 packs), inline so it runs under our lock
+G config gc.autoPackLimit "${SHARE_GC_PACKS:-8}"; G config gc.autoDetach false
+big_mb="${SHARE_BIG_MB:-20}"; reserve_mb="${SHARE_DISK_RESERVE_MB:-1024}"
+free_kb() { df -Pk "$d" 2>/dev/null | awk 'NR==2{print $4}'; }
+packs()   { ls "$d/.git/objects/pack"/*.pack 2>/dev/null | wc -l | tr -d ' '; }
 
 # `git add` can lose the race with an editor mid-write ("short read while indexing") —
 # retry, then skip this tick. Never fatal: one bad tick must not take a loop down.
@@ -202,7 +222,13 @@ commit_dirty() {
     G add -A >/dev/null 2>&1 && break
     [ "$i" = 3 ] && { log "git add failed (file mid-write?) — skipping this tick"; return 0; }; sleep 1
   done
-  G diff --cached --quiet 2>/dev/null || G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)" >/dev/null 2>&1 || log "git commit failed — will retry next tick"
+  G diff --cached --quiet 2>/dev/null && return 0
+  G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)" >/dev/null 2>&1 || { log "git commit failed — will retry next tick"; return 0; }
+  # big binaries never delta: every peer keeps every version forever — say so once, at the commit that adds it
+  local p sz; while IFS= read -r p; do
+    [ -n "$p" ] || continue; sz="$(G cat-file -s "HEAD:$p" 2>/dev/null || echo 0)"
+    [ "$sz" -lt $((big_mb * 1048576)) ] || log "large file $((sz / 1048576))MB: $p — binaries carry no deltas; ignore it or keep it out of the synced tree"
+  done < <(G diff-tree --no-commit-id -r --diff-filter=AM --name-only HEAD 2>/dev/null)
 }
 
 # The loops run with errexit OFF: a failing git call must log and move on, not exit
@@ -215,14 +241,21 @@ pusher() {
     head="$(G rev-parse -q --verify HEAD 2>/dev/null || true)"
     sent="$(G rev-parse -q --verify refs/share/sent 2>/dev/null || true)"
     if [ -n "$head" ] && [ "$head" != "$sent" ]; then
-      G bundle create "$bf" HEAD >/dev/null 2>&1; unlock
+      # only what they lack: everything reachable from HEAD but not from their last-received HEAD
+      theirs="$(G rev-parse -q --verify refs/share/theirs 2>/dev/null || true)"
+      if [ -n "$theirs" ] && [ "$(G rev-list --count HEAD --not "$theirs" 2>/dev/null || echo 1)" = 0 ]; then
+        G update-ref refs/share/sent "$head"; unlock; log "nothing to push — $f already has ${head:0:7}"; continue
+      fi
+      if [ "$(free_kb)" -lt $((reserve_mb * 1024)) ]; then unlock; log "DISK LOW — $(($(free_kb) / 1024))MB free < ${reserve_mb}MB reserve; not bundling, retrying in ${every}s"; sleep "$every"; continue; fi
+      if ! G bundle create "$bf" HEAD ${theirs:+--not "$theirs"} >/dev/null 2>&1; then unlock; log "bundle create failed — retrying in ${every}s"; sleep "$every"; continue; fi
+      unlock
       printf '%s %s %s\n' "$(date +%s)" "$head" "$(date -u +%F)" > "$pushf"
       # blocks until they pull — that block is the delivery ack (the watchdog bounds it: see pmax).
       # Wrapper + wait: a watchdog kill is a plain exit status (see kill_grandkids). A reset flag outranks
       # an exit 0 — croc exits 0 when killed, and that must never count as delivered.
       bash -c 'push "$@"; exit $?' _ --friend "$f" --salt "$out" "$bf" >/dev/null 2>&1 &
       if wait "$!" && [ ! -f "$resetf" ]; then
-        rm -f "$pushf"; lock; G update-ref refs/share/sent "$head"; unlock; log "pushed ${head:0:7}"
+        rm -f "$pushf"; lock; G update-ref refs/share/sent "$head"; unlock; log "pushed ${head:0:7} ($(du -k "$bf" 2>/dev/null | cut -f1)KB${theirs:+, since ${theirs:0:7}})"
       elif [ -f "$resetf" ]; then rm -f "$pushf"; log "push reopened — $(cat "$resetf")"; rm -f "$resetf"
       else rm -f "$pushf"; log "push failed — retrying in ${every}s"; sleep "$every"; fi
     else unlock; sleep "$every"; fi
@@ -242,8 +275,14 @@ puller() {
         log "INCOMPATIBLE PEER — $f sent $(ls "$stage" | head -3 | paste -sd, -) instead of share-sync-v1.bundle; both sides must run the same major version: brew upgrade share"
         sleep "$every"; continue
       fi
+      bkb="$(du -k "$bundle" 2>/dev/null | cut -f1)"; fkb="$(free_kb)"
+      if [ "${fkb:-0}" -lt $((bkb * 3 + reserve_mb * 1024)) ]; then
+        log "DISK LOW — $((fkb / 1024))MB free, bundle $((bkb / 1024))MB needs 3x + ${reserve_mb}MB reserve; skipped (their next push re-covers it) — free space, then: share sync check --repair"
+        sleep "$every"; continue
+      fi
       lock; commit_dirty
-      if ! G fetch -q "$bundle" HEAD 2>/dev/null; then log "bad bundle — skipped"; unlock; continue; fi
+      if ! G fetch -q "$bundle" HEAD 2>/dev/null; then log "bad bundle — skipped (their next push re-covers it)"; unlock; continue; fi
+      G update-ref refs/share/theirs FETCH_HEAD 2>/dev/null   # the basis of our next bundle to them
       if ! G rev-parse -q --verify HEAD >/dev/null 2>&1; then
         G reset -q --hard FETCH_HEAD; log "adopted their history"
       elif G merge -q -m "sync: received from $f" --allow-unrelated-histories FETCH_HEAD >/dev/null 2>&1; then
@@ -258,6 +297,8 @@ puller() {
         G add -A; G commit -qm "sync: conflict — kept ours, saved theirs as .conflict-*"
         log "merged with conflict copies"
       fi
+      pb="$(packs)"; G gc --auto -q >/dev/null 2>&1; pa="$(packs)"
+      [ "$pb" = "$pa" ] || log "compacted $pb packs -> $pa (.git $(du -sk "$d/.git" 2>/dev/null | cut -f1 | awk '{if ($1 >= 1024) printf "%.1fMB", $1/1024; else printf "%dKB", $1}'))"
       unlock
     else
       # pull fails hard only when croc itself fails (relay unreachable, bad binary) — say so once, not every tick

@@ -84,6 +84,10 @@ Under the hood each side keeps a **local git repo** in the folder — the git *b
 - other file types that truly conflict keep **yours** in place and save **theirs** beside it as `NAME.conflict-<timestamp>`
 - **deletes propagate**; full history sits in `.git` on each side (squash if it ever bothers you)
 - a push only happens when there are new commits, and it blocks until received — that's the delivery ack
+- bundles are **incremental** — only the commits the other side lacks (basis: their last-received HEAD, `refs/share/theirs`), so a 600 MB history does not travel again on every edit; a bundle they could not apply is simply re-covered by the next one
+- the repo **compacts itself** — `git gc --auto` after every received bundle with a low pack limit (`SHARE_GC_PACKS`, default 8), so it never balloons into dozens of identical packs
+- a **disk fence** skips a pull that would not fit (3x the bundle + `SHARE_DISK_RESERVE_MB`, default 1024) with a loud `DISK LOW` log line instead of wedging git mid-write; `status` shows disk use from 80%
+- a commit that adds a file over `SHARE_BIG_MB` (default 20) is **called out in the log** — binaries never delta, every peer keeps every version
 
 ## Commands
 
