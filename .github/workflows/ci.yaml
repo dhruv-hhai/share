@@ -109,6 +109,9 @@ jobs:
           CROC_RELAY: localhost:9009
         run: test/sync-e2e /tmp/sync-e2e
 
+      - name: Sync watchdog — a transfer in flight is bounded by progress, not the waiting cap (stub croc, no relay)
+        run: test/sync-watchdog
+
       - name: Update — --installed prints a version, --check reaches GitHub and exits 0/1
         run: |
           set -euo pipefail

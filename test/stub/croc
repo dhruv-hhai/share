@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# stub croc: mimics croc's sender stderr ("Sending 'f' (size)", then "\nSending (->ip)" when the peer connects,
+# then \r progress lines). Behaviour from env: STUB_MODE=wait (peer never comes) | transfer | stall
+#   STUB_CONNECT_AFTER  seconds before the peer "connects" (default 1)
+#   STUB_DURATION       seconds of progress for transfer mode (default 20)
+[ "${1:-}" = --version ] && { echo "croc stub"; exit 0; }
+case " $* " in
+  *" send "*)
+    echo "Sending 'share-sync-v1.bundle' (1.0 MB)" >&2
+    echo "Code is: $CROC_SECRET" >&2
+    mode="${STUB_MODE:-transfer}"
+    if [ "$mode" = wait ]; then while :; do sleep 1; done; fi
+    sleep "${STUB_CONNECT_AFTER:-1}"
+    printf '\nSending (->127.0.0.1:9009)\n' >&2
+    if [ "$mode" = stall ]; then printf '\r share-sync-v1.bundle   3%%\n' >&2; while :; do sleep 1; done; fi
+    n="${STUB_DURATION:-20}"
+    for i in $(seq 1 "$n"); do printf '\r share-sync-v1.bundle %3d%%' $((i * 100 / n)) >&2; sleep 1; done
+    printf '\n' >&2; exit 0;;
+  *)  # receive: nobody is sending to us in these tests
+    echo "waiting for sender" >&2; while :; do sleep 1; done;;
+esac

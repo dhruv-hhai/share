@@ -22,11 +22,15 @@
 # Health: every wait is bounded and visible. `status`/`check` verdicts:
 #   ok            loops alive, nothing queued
 #   waiting-peer  a push is open at the relay, waiting for them to come online
-#   stuck         heartbeat stopped, lock stale, or a push older than the cap — restart it
+#   sending       they connected; a push is transferring and croc shows progress
+#   stuck         heartbeat stopped, lock stale, a waiting push older than the cap,
+#                 or a transfer with no progress — restart it
 #   down          configured (or was running) but no daemon — `check --repair` restarts it
 # The daemon's watchdog resets what it can on its own: respawns a dead loop,
-# reopens a push older than SHARE_PUSH_MAX seconds (default 7200) or from
-# before the UTC-midnight code rotation, reconnects after a sleep/wake clock
+# reopens a push still WAITING after SHARE_PUSH_MAX seconds (default 7200) or
+# from before the UTC-midnight code rotation, reopens a TRANSFER only when croc
+# shows no progress for SHARE_PUSH_STALL seconds (default 900) — never merely
+# for taking long, so big folders on slow links finish — reconnects after a sleep/wake clock
 # jump, breaks a lock held >10 min, commits local edits on its own tick (so a
 # blocked push never holds your edits hostage). Cron:  */5 * * * * share sync check --repair
 # Protocol: the payload is a single file named share-sync-v1.bundle — anything
@@ -50,15 +54,25 @@ set -euo pipefail
 tmp="${TMPDIR:-/tmp}"
 cfgd="${XDG_CONFIG_HOME:-$HOME/.config}/share/sync"   # one file per friend: "ROLE EVERY DIR" — survives reboot + $TMPDIR purge
 pmax="${SHARE_PUSH_MAX:-7200}"                        # reopen a push waiting longer than this (relay drops unclaimed rooms ~3h)
+pstall="${SHARE_PUSH_STALL:-900}"                     # once bytes flow, reopen only if croc shows no progress for this long
 
 # Daemons found by process scan, one line per daemon: "PGID FRIEND ROLE". The pid
 # file is the primary record, but macOS purges $TMPDIR files untouched for ~3 days
 # (the daemon touches its own, but older ones lost theirs) — this is the fallback.
 # pgid = the setsid leader = the pid the file would hold; sort -u folds the loop subshells.
 daemons_ps() { ps -axo pgid=,command= | sed -n 's/^ *\([0-9][0-9]*\) .*tools\/sync --fg --friend \([^ ]*\) --role \([ab]\).*$/\1 \2 \3/p' | sort -u; }
-mtime()      { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# GNU first: GNU `stat -f` means --file-system and prints a block of text before failing, which the BSD-first order
+# captured as the "mtime" on Linux. BSD `stat -c` fails cleanly with nothing on stdout.
+mtime()      { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 ago()        { if [ "$1" -ge 3600 ]; then printf '%dh%02dm' $(($1/3600)) $(($1%3600/60)); elif [ "$1" -ge 60 ]; then printf '%dm' $(($1/60)); else printf '%ds' "$1"; fi; }
 older()      { [ -e "$1" ] && [ -n "$(find "$1" -maxdepth 0 -mmin +"$2" 2>/dev/null)" ]; }   # path, minutes
+# A push has two phases: waiting at the relay for the peer, then transferring. The room caps (SHARE_PUSH_MAX, UTC
+# rotation) only make sense while waiting — a transfer in flight already has its connection, and killing it threw
+# away every byte sent (a big bundle on a slow link restarted from zero forever). croc's sender prints "Sending ("
+# the moment the peer connects, then a progress bar that rewrites the log as bytes move: started = that line is
+# there, progress age = how long since the log last changed.
+sending()    { grep -qF 'Sending (' "$tmp/share-sync-$1.pushlog" 2>/dev/null; }
+quiet_for()  { echo $(( $(date +%s) - $(mtime "$tmp/share-sync-$1.pushlog") )); }
 # Every friend we know of: pid files, live processes, saved configs.
 friends_known() { { for p in "$tmp"/share-sync-*.pid; do [ -f "$p" ] && { p="$(basename "$p" .pid)"; echo "${p#share-sync-}"; }; done
                     daemons_ps | awk '{print $2}'
@@ -76,8 +90,14 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
     if [ -f "$pf" ] && older "$pf" 2; then v=stuck; d="$d, heartbeat $(ago $((now - $(mtime "$pf")))) old"; fi
     if older "$tmp/share-sync-$f.gitlock" 10; then v=stuck; d="$d, lock stale $(ago $((now - $(mtime "$tmp/share-sync-$f.gitlock"))))"; fi
     if [ -f "$tmp/share-sync-$f.push" ]; then
-      read -r age _ < "$tmp/share-sync-$f.push"; age=$((now - age)); d="$d, push waiting $(ago "$age")"
-      if [ "$age" -gt $((pmax + 300)) ]; then v=stuck; else v="${v:-waiting-peer}"; fi
+      read -r age _ < "$tmp/share-sync-$f.push"; age=$((now - age))
+      if sending "$f"; then local q; q="$(quiet_for "$f")"
+        d="$d, push sending for $(ago "$age") (progress $(ago "$q") ago)"
+        if [ "$q" -gt $((pstall + 300)) ]; then v=stuck; else v="${v:-sending}"; fi
+      else
+        d="$d, push waiting $(ago "$age")"
+        if [ "$age" -gt $((pmax + 300)) ]; then v=stuck; else v="${v:-waiting-peer}"; fi
+      fi
     fi
     v="${v:-ok}"
   fi
@@ -97,7 +117,7 @@ stop_friend() { local f="$1"; local p="" pf="$tmp/share-sync-$f.pid"
   [ -n "$p" ] || p="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
   [ -n "$p" ] || { echo "share sync: nothing running for $f" >&2; return 1; }
   kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
-  rm -f "$pf" "$tmp/share-sync-$f.push" "$tmp/share-sync-$f.reset" 2>/dev/null; rmdir "$tmp/share-sync-$f.gitlock" 2>/dev/null || true
+  rm -f "$pf" "$tmp/share-sync-$f.push" "$tmp/share-sync-$f.pushlog" "$tmp/share-sync-$f.reset" 2>/dev/null; rmdir "$tmp/share-sync-$f.gitlock" 2>/dev/null || true
   echo "share sync: stopped $f (pid $p and its tree)"; }
 # remember F: a daemon started before configs existed (or whose config was lost) — learn role/dir from its pid file
 remember()    { [ -f "$cfgd/$1" ] && return 0; info "$1"; { [ -n "$role" ] && [ -n "$dir" ]; } || return 1; mkdir -p "$cfgd"; printf '%s %s %s\n' "$role" 15 "$dir" > "$cfgd/$1"; }
@@ -118,7 +138,7 @@ case "$sub" in
     bad=0
     while read -r n; do [ -n "$n" ] || continue
       h="$(health "$n")"; IFS=$'\t' read -r v d _ _ <<< "$h"; printf '%-12s %-13s %s\n' "$n" "$v" "$d"
-      case "$v" in ok|waiting-peer) continue;; esac
+      case "$v" in ok|waiting-peer|sending) continue;; esac
       if [ -n "$repair" ]; then
         remember "$n" || true; [ "$v" = down ] || stop_friend "$n" || true
         if start_saved "$n"; then echo "share sync: repaired $n"; else bad=1; fi
@@ -190,7 +210,8 @@ stage="$tmp/share-sync-$f-in"; mkdir -p "$stage"
 lk="$tmp/share-sync-$f.gitlock"   # mkdir-lock serializes the loops on one repo
 pushf="$tmp/share-sync-$f.push"   # "EPOCH HEAD UTCDAY" while a push is open at the relay — what status/watchdog read
 resetf="$tmp/share-sync-$f.reset" # watchdog leaves its reason here when it kills a push; the pusher reports it
-rmdir "$lk" 2>/dev/null || true; rm -f "$pushf" "$resetf"   # a fresh daemon owns the repo — leftovers of a dead one must not block it
+pushlog="$tmp/share-sync-$f.pushlog" # the open push's own output (croc's progress) — what sending()/quiet_for() read
+rmdir "$lk" 2>/dev/null || true; rm -f "$pushf" "$resetf" "$pushlog"   # a fresh daemon owns the repo — leftovers of a dead one must not block it
 
 log()    { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 G()      { git -C "$d" "$@"; }
@@ -250,15 +271,20 @@ pusher() {
       if [ "$(free_kb)" -lt $((reserve_mb * 1024)) ]; then unlock; log "DISK LOW — $(($(free_kb) / 1024))MB free < ${reserve_mb}MB reserve; not bundling, retrying in ${every}s"; sleep "$every"; continue; fi
       if ! G bundle create "$bf" HEAD ${theirs:+--not "$theirs"} >/dev/null 2>&1; then unlock; log "bundle create failed — retrying in ${every}s"; sleep "$every"; continue; fi
       unlock
-      printf '%s %s %s\n' "$(date +%s)" "$head" "$(date -u +%F)" > "$pushf"
-      # blocks until they pull — that block is the delivery ack (the watchdog bounds it: see pmax).
+      t0="$(date +%s)"
+      printf '%s %s %s\n' "$t0" "$head" "$(date -u +%F)" > "$pushf"
+      # croc prints today's code into this log: owner-only (a world-readable /tmp file would hand it to local users)
+      rm -f "$pushlog"; (umask 077; : > "$pushlog")
+      # blocks until they pull — that block is the delivery ack (the watchdog bounds the wait: see pmax; a transfer
+      # in flight is bounded by progress instead: see pstall).
       # Wrapper + wait: a watchdog kill is a plain exit status (see kill_grandkids). A reset flag outranks
       # an exit 0 — croc exits 0 when killed, and that must never count as delivered.
-      bash -c 'push "$@"; exit $?' _ --friend "$f" --salt "$out" "$bf" >/dev/null 2>&1 &
+      bash -c 'push "$@"; exit $?' _ --friend "$f" --salt "$out" "$bf" >>"$pushlog" 2>&1 &
       if wait "$!" && [ ! -f "$resetf" ]; then
-        rm -f "$pushf"; lock; G update-ref refs/share/sent "$head"; unlock; log "pushed ${head:0:7} ($(du -k "$bf" 2>/dev/null | cut -f1)KB${theirs:+, since ${theirs:0:7}})"
-      elif [ -f "$resetf" ]; then rm -f "$pushf"; log "push reopened — $(cat "$resetf")"; rm -f "$resetf"
-      else rm -f "$pushf"; log "push failed — retrying in ${every}s"; sleep "$every"; fi
+        rm -f "$pushf" "$pushlog"; lock; G update-ref refs/share/sent "$head"; unlock
+        log "pushed ${head:0:7} ($(du -k "$bf" 2>/dev/null | cut -f1)KB${theirs:+, since ${theirs:0:7}}) in $(ago $(($(date +%s) - t0)))"
+      elif [ -f "$resetf" ]; then rm -f "$pushf" "$pushlog"; log "push reopened — $(cat "$resetf")"; rm -f "$resetf"
+      else rm -f "$pushf" "$pushlog"; log "push failed — retrying in ${every}s"; sleep "$every"; fi
     else unlock; sleep "$every"; fi
   done
 }
@@ -324,18 +350,22 @@ follow() {
 }
 
 # Watchdog (runs in the supervisor, every 5s): what `check` would restart the daemon for, fixed in place.
-#   - a push open longer than pmax, or opened before the UTC-midnight code rotation, is killed → pusher reopens it
+#   - a push still waiting longer than pmax, or opened before the UTC-midnight code rotation, is killed → pusher reopens it
+#   - a push already transferring is left alone however long it takes; killed only after pstall seconds with no progress
 #   - a clock jump (laptop slept) → kill in-flight push/pull so croc reconnects instead of trusting a dead socket
 #   - the pid-file touch is the heartbeat `status` reads; the commit tick keeps edits flowing while a push blocks
 reset_push() { [ -f "$pushf" ] || return 0; echo "$1" > "$resetf"; kill_grandkids "$pp"; }
 watch() {
-  local now pt pday age
+  local now pt pday age q
   now="$(date +%s)"
   if [ $((now - last)) -gt 90 ]; then log "clock jumped $(ago $((now - last))) (sleep/wake?) — reconnecting"; reset_push "clock jumped (sleep/wake)"; kill_grandkids "$lp"; fi
   last="$now"
   if [ -f "$pushf" ] && read -r pt _ pday < "$pushf"; then
     age=$((now - pt))
-    if [ "$age" -gt "$pmax" ]; then reset_push "waited $(ago "$age") > cap $(ago "$pmax") (relay drops unclaimed rooms ~3h)"
+    if sending "$f"; then   # connected and moving bytes: the room caps no longer apply, only a stall does
+      q="$(quiet_for "$f")"
+      [ "$q" -le "$pstall" ] || reset_push "transfer stalled — no progress for $(ago "$q") > $(ago "$pstall") (after $(ago "$age"))"
+    elif [ "$age" -gt "$pmax" ]; then reset_push "waited $(ago "$age") > cap $(ago "$pmax") (relay drops unclaimed rooms ~3h)"
     elif [ "$pday" != "$(date -u +%F)" ]; then reset_push "code rotated at UTC midnight while waiting $(ago "$age")"; fi
   fi
   if [ $((now - lastc)) -ge "$every" ]; then lock; commit_dirty; unlock; lastc="$now"; fi

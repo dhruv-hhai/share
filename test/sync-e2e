@@ -26,7 +26,7 @@ until_ok 90 test -f "$W/b/hi.md" || fail "a→b round trip"; pass "a→b round t
 echo "hello from bob" > "$W/b/re.md"
 until_ok 90 test -f "$W/a/re.md" || fail "b→a round trip"; pass "b→a round trip"
 
-A status | grep -E '^bob +role a +(ok|waiting-peer) ' || fail "status verdict: $(A status)"; pass "status shows a healthy verdict"
+A status | grep -E '^bob +role a +(ok|waiting-peer|sending) ' || fail "status verdict: $(A status)"; pass "status shows a healthy verdict"
 until_ok 30 A check --friend bob >/dev/null || fail "check exit 0 when healthy"; pass "check --friend exits 0 when healthy"
 grep -q '^a 2 ' "$W/cfg/share/sync/bob" || fail "saved config: $(cat "$W/cfg/share/sync/bob")"; pass "config saved (role every dir)"
 

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# sync watchdog phases, hermetic: a stub croc (test/stub/croc) plays the peer, so no relay and no network.
+# A push WAITING for the peer is bounded by SHARE_PUSH_MAX; a push already TRANSFERRING is bounded only by
+# progress (SHARE_PUSH_STALL) — a long transfer must finish, never be cut off and restarted from zero.
+# usage: test/sync-watchdog        (~1 min)
+set -uo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"; share="$repo/share"
+export PATH="$repo/test/stub:$PATH" SHARE_SECRET_BOB="watchdog-$$" SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EVERY=3600
+pass() { echo "  ok  $*"; }
+fail() { echo "FAIL  $*" >&2; echo "--- log"; cat "$W/t/share-sync-bob.log" 2>/dev/null; exit 1; }
+# start MODE [env...]: one daemon (alice's side, friend bob, role a) against the stub in MODE, every 1s
+start() { local mode="$1"; shift
+  W="$(mktemp -d)"; mkdir -p "$W"/{d,t,cfg}; echo "payload" > "$W/d/hi.md"
+  env TMPDIR="$W/t" XDG_CONFIG_HOME="$W/cfg" STUB_MODE="$mode" "$@" "$share" sync --friend bob --role a --dir "$W/d" --every 1 >/dev/null; }
+S()    { TMPDIR="$W/t" XDG_CONFIG_HOME="$W/cfg" "$share" sync "$@"; }
+stop() { S stop --friend bob >/dev/null 2>&1 || true; rm -rf "$W"; }
+logs() { grep -c "$1" "$W/t/share-sync-bob.log" 2>/dev/null || true; }
+until_ok() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" 2>/dev/null && return 0; sleep 1; done; return 1; }
+trap 'stop' EXIT
+
+echo "sync watchdog (stub croc)"
+
+# 1. a 20s transfer under a 4s waiting cap: must complete in one go
+start transfer SHARE_PUSH_MAX=4 STUB_DURATION=20
+until_ok 10 sh -c "TMPDIR='$W/t' XDG_CONFIG_HOME='$W/cfg' '$share' sync status | grep -q ' sending .*push sending for'" || fail "sending verdict during a transfer: $(S status)"
+pass "verdict 'sending' while bytes move"
+until_ok 15 test -f "$W/t/share-sync-bob.pushlog" || fail "push log exists while a push is open"
+[ "$(stat -c %a "$W/t/share-sync-bob.pushlog" 2>/dev/null || stat -f %Lp "$W/t/share-sync-bob.pushlog")" = 600 ] || fail "push log (holds today's code) must be owner-only"
+pass "push log is owner-only (it holds today's code)"
+until_ok 40 grep -q 'pushed [0-9a-f]* (.*) in [0-9]' "$W/t/share-sync-bob.log" || fail "long transfer never completed"
+[ "$(logs 'push reopened')" = 0 ] || fail "a transfer in flight was reopened by the waiting cap"
+pass "20s transfer past a 4s cap completes, never reopened"
+S check --friend bob >/dev/null || fail "check exits 0 after delivery: $(S check --friend bob)"
+pass "check healthy after delivery"
+stop
+
+# 2. the peer never connects: the waiting cap still applies
+start wait SHARE_PUSH_MAX=4
+until_ok 20 grep -q 'push reopened — waited .* > cap' "$W/t/share-sync-bob.log" || fail "waiting push not reopened at the cap"
+pass "waiting push still reopened at the cap"
+stop
+
+# 3. connected, then no progress: reopened as a stall, and the reopen is not counted as delivered
+start stall SHARE_PUSH_MAX=4 SHARE_PUSH_STALL=5
+until_ok 25 grep -q 'push reopened — transfer stalled — no progress' "$W/t/share-sync-bob.log" || fail "stalled transfer not reopened"
+pass "stalled transfer reopened"
+[ -z "$(git -C "$W/d" rev-parse -q --verify refs/share/sent 2>/dev/null)" ] || fail "stalled push must not count as delivered"
+pass "stalled push not marked sent"
+echo "all watchdog checks passed"
