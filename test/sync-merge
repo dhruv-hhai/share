@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Pure register algebra, including a seeded corpus; no transport or git.
+set -euo pipefail
+sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
+# shellcheck source=../lib/sync-state.sh
+. "$sync_lib/sync-state.sh"
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+check() {
+  sync_merge "$w/a" "$w/b" > "$w/ab"
+  sync_merge "$w/b" "$w/a" > "$w/ba"; cmp "$w/ab" "$w/ba"
+  sync_merge "$w/a" "$w/a" > "$w/aa"; cmp "$w/a" "$w/aa"
+  sync_merge "$w/ab" "$w/c" > "$w/left"
+  sync_merge "$w/b" "$w/c" > "$w/bc"
+  sync_merge "$w/a" "$w/bc" > "$w/right"; cmp "$w/left" "$w/right"
+}
+printf 'p\tx\t-\ta:1\n' > "$w/a"
+printf 'p\tx\t-\tb:1\n' > "$w/b"
+printf 'p\ty\t-\ta:1,b:1\n' > "$w/c"
+check; cmp "$w/c" "$w/left"
+[ "$(wc -l < "$w/ab")" -eq 2 ] # same bytes, independent causality
+printf 'p\t-\t-\ta:2\n' > "$w/b"
+sync_merge "$w/a" "$w/b" > "$w/result"; cmp "$w/b" "$w/result"
+printf 'p\tz\t-\ta:3\n' > "$w/c"
+check; cmp "$w/c" "$w/left" # resurrection
+printf 'p\t-\t-\tb:1\n' > "$w/c"
+check # concurrent deletes, concurrent edit/delete
+[ "$(sync_conflict_name dir/notes.md abcdef1234)" = dir/notes.conflict-abcdef12.md ]
+[ "$(sync_conflict_name .config abcdef1234)" = .config.conflict-abcdef12 ]
+printf 'p\tx\t-\ta:2,b:1\np\ty\t-\tb:3\n' | sync_clock c > "$w/clock"
+[ "$(cat "$w/clock")" = a:2,b:3,c:1 ]
+# A portable explicit LCG avoids awk implementations' different srand streams.
+awk 'BEGIN{s=71237; for(t=1;t<=300;t++)for(f=1;f<=3;f++)for(i=1;i<=5;i++){
+ s=(s*16807)%2147483647; a=s%5; s=(s*16807)%2147483647; b=s%5;
+ s=(s*16807)%2147483647; h=s%4;
+ printf "%d\t%d\tp%d\t%s\t-\ta:%d,b:%d\n",t,f,i%2,h==0?"-":h,a,b}}' > "$w/corpus"
+for t in $(seq 1 300); do
+  for f in 1 2 3; do
+    awk -F '\t' -v t="$t" -v f="$f" '$1==t&&$2==f{sub(/^[^\t]*\t[^\t]*\t/,"");print}' "$w/corpus" > "$w/raw"
+    case "$f" in 1) dest=a;; 2) dest=b;; 3) dest=c;; esac
+    sync_merge "$w/raw" > "$w/$dest"
+  done
+  check
+done
+echo 'merge: fixed regressions and 300 seeded algebra triples passed'
