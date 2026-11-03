@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154,SC2034
+# Exercise the actual filesystem engine without a transport or daemon.
+set -euo pipefail
+export LC_ALL=C
+sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
+# shellcheck source=../lib/sync-state.sh
+. "$sync_lib/sync-state.sh"
+# shellcheck source=../lib/sync-files.sh
+. "$sync_lib/sync-files.sh"
+# shellcheck source=../lib/sync-payload.sh
+. "$sync_lib/sync-payload.sh"
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+log() { echo "$*" >&2; }
+d="$w/a"; f=b; mkdir -p "$d"; init_state
+echo original > "$d/hello.txt"; scan; retain_blobs
+test "$(wc -l < "$state/manifest")" -eq 1
+bd="$w/out"; bf="$bd/share-sync-v2.tar"; mkdir -p "$bd"; make_payload
+d="$w/b"; f=a; mkdir -p "$d"; init_state
+receive_payload "$bf"; cmp "$w/a/hello.txt" "$w/b/hello.txt"
+echo edited > "$d/hello.txt"; scan
+rm "$d/hello.txt"; scan
+grep -q $'hello.txt\t-\t' "$state/manifest"
+echo resurrected > "$d/hello.txt"; scan
+test "$(wc -l < "$state/manifest")" -eq 1
+echo 'filesystem: initial transfer, edit, delete, resurrection passed'
+# A local edit made after an incoming merge but before apply is concurrent,
+# rather than a causal successor of unseen incoming bytes.
+old_manifest="$w/b-before"; cp "$state/manifest" "$old_manifest"
+echo remote > "$state/snapshot"; h="$(hash_file "$state/snapshot")"; cp "$state/snapshot" "$state/blobs/$h"
+oldh="$(cut -f2 "$old_manifest")"; vv="$(sync_clock abcdef < "$old_manifest")"
+printf 'hello.txt\t%s\t%s\t%s\n' "$h" "$oldh" "$vv" > "$state/incoming"
+sync_merge "$state/manifest" "$state/incoming" > "$state/manifest.new"; mv "$state/manifest.new" "$state/manifest"
+echo intervening > "$d/hello.txt"
+materialize
+[ "$(path_entries hello.txt | wc -l)" -eq 2 ]
+grep -rl intervening "$d" --exclude-dir=.share >/dev/null
+grep -rl remote "$d" --exclude-dir=.share >/dev/null
+echo 'filesystem: mid-apply edit and incoming content both preserved'
+# Missing and corrupt blobs never create an unmaterializable manifest entry.
+mkdir -p "$w/payload/blobs" "$w/payload/base"
+printf '2\n' > "$w/payload/version"; echo abcdef > "$w/payload/replica"
+printf 'missing.bin\t%064d\t-\tabcdef:1\n' 1 > "$w/payload/manifest"
+tar -cf "$w/missing.tar" -C "$w/payload" version replica manifest blobs base
+receive_payload "$w/missing.tar"
+! grep -q missing.bin "$state/manifest"
+echo corrupt > "$w/payload/blobs/$(printf '%064d' 1)"
+tar -cf "$w/corrupt.tar" -C "$w/payload" version replica manifest blobs base
+if receive_payload "$w/corrupt.tar"; then echo 'corrupt blob accepted' >&2; exit 1; fi
+echo 'filesystem: missing and corrupt blobs refused'
+d="$w/safety"; mkdir -p "$d/ignored"; init_state
+printf '*.secret\nignored/\n' > "$d/.shareignore"
+echo skip > "$d/token.secret"; echo skip > "$d/ignored/file"
+echo skip > "$d/.DS_Store"
+echo keep > "$d/name with spaces.txt"; echo keep > "$d/back\\slash.txt"
+echo skip > "$d/"$'tab\tname'; echo skip > "$d/"$'line\nname'
+ln -s "$w/a/hello.txt" "$d/link"
+scan; scan
+[ "$(wc -l < "$state/manifest")" -eq 3 ]
+grep -F 'back\slash.txt' "$state/manifest" >/dev/null
+[ "$(find "$state" -name 'skipped-*' | wc -l)" -eq 2 ]
+echo 'filesystem: ignores, spaces/backslashes, unsupported names and symlinks'
+printf 'name with spaces.txt\n' >> "$d/.shareignore"
+scan; make_payload
+tar -xOf "$bf" manifest > "$w/filtered"
+! grep -q 'name with spaces.txt' "$w/filtered"
+grep -q '^.shareignore' "$w/filtered"
+echo 'filesystem: new ignores suppress previously tracked outgoing content'

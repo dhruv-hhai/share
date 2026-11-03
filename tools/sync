@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# desc: continuous two-way folder sync with a friend — git-merged, nothing lost
+# shellcheck disable=SC2154
+# desc: continuous two-way folder sync with a friend — causal file registers and deterministic conflicts
 # usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]
 #        share sync --friend NAME          restart from the saved config (role/dir remembered per friend)
 #        share sync status                 every sync daemon: friend, role, health verdict, pid, dir
@@ -9,16 +10,11 @@
 #        share sync log --friend NAME      where the log is + last lines
 #        share sync history --friend NAME [N]   last N file changes (default 20): who, when, A/M/D per file
 # Runs in the background by default (its own process group; log in $TMPDIR).
-# Needs the git BINARY only — no account, no remote, no network git: each side
-# keeps a local repo inside the folder and what travels (over the same croc
-# relay, in two direction-scoped rooms via code --salt) is a git bundle file.
-# Role a pushes on sync-a2b and pulls sync-b2a; role b the opposite — agree
-# roles once, out of band.
-# Semantics: edits are committed locally, bundles are merged on arrival.
-# Deletes propagate. Concurrent edits to one text file (*.md/*.txt) merge as
-# append-both (union); other conflicting files keep YOURS in place and save
-# THEIRS beside it as NAME.conflict-<timestamp> — no byte is ever dropped.
-# A stale queued push can no longer eat a local edit: merging, not overwriting.
+# State-based file registers in .share/: portable version vectors and content
+# hashes, no git engine. Role a sends on sync-a2b, role b on sync-b2a.
+# Concurrent edits keep a deterministic winner and content-named conflict
+# copies; an elected replica may merge nonoverlapping text edits with diff3.
+# Causal siblings are retained until a normal edit supersedes them.
 # Health: every wait is bounded and visible. `status`/`check` verdicts:
 #   ok            loops alive, nothing queued
 #   waiting-peer  a push is open at the relay, waiting for them to come online
@@ -31,26 +27,24 @@
 # from before the UTC-midnight code rotation, reopens a TRANSFER only when croc
 # shows no progress for SHARE_PUSH_STALL seconds (default 900) — never merely
 # for taking long, so big folders on slow links finish — reconnects after a sleep/wake clock
-# jump, breaks a lock held >10 min, commits local edits on its own tick (so a
+# jump, breaks a lock held >10 min, versions local edits on its own tick (so a
 # blocked push never holds your edits hostage). Cron:  */5 * * * * share sync check --repair
-# Protocol: the payload is a single file named share-sync-v1.bundle — anything
-# else arriving in the sync room is an incompatible peer and is refused LOUDLY
-# (both sides must run the same major version; payload changes bump the major).
-# Transfer is incremental: a bundle carries only commits the peer lacks, judged
-# by refs/share/theirs (their HEAD as last received). Their own history is the
-# bundle's basis, so prerequisites are always present on their side; a bundle
-# they could not apply (disk full, bad transfer) is simply re-covered by our next
-# one, because refs/share/theirs only advances when THEY send US something.
-# Hygiene (what a big object store does for you, done here): every received
-# bundle is followed by `git gc --auto` with a low pack limit (gc.autoPackLimit,
-# default 8), so the repo never balloons into dozens of identical packs; a pull
-# whose bundle would not fit in the free space (3x its size + SHARE_DISK_RESERVE_MB,
-# default 1024) is skipped with a loud DISK LOW line and re-covered later; a commit
-# that adds a file over SHARE_BIG_MB (default 20) is logged — binaries carry no
-# deltas and every peer keeps every version. `status` reports disk use.
-# CAVEATS: union merge is line-based — simultaneous edits to the same line
-# arrive as both lines, adjacent; history grows in .git (squash if you care).
+# Protocol: share-sync-v2.tar contains version, replica, manifest, blobs/base.
+# Unknown payload names are refused: upgrade both sides together.
+# Missing blobs are retried; peer manifests are only bandwidth hints.
+# State stores current content and bounded text bases, not historical binaries.
+# File IO and the pure merge live in ../lib; transport/watchdog stay here.
 set -euo pipefail
+# state is initialized by init_state in lib/sync-files.sh.
+# shellcheck disable=SC2154
+export LC_ALL=C
+sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
+# shellcheck source=../lib/sync-state.sh
+. "$sync_lib/sync-state.sh"
+# shellcheck source=../lib/sync-files.sh
+. "$sync_lib/sync-files.sh"
+# shellcheck source=../lib/sync-payload.sh
+. "$sync_lib/sync-payload.sh"
 tmp="${TMPDIR:-/tmp}"
 cfgd="${XDG_CONFIG_HOME:-$HOME/.config}/share/sync"   # one file per friend: "ROLE EVERY DIR" — survives reboot + $TMPDIR purge
 pmax="${SHARE_PUSH_MAX:-7200}"                        # reopen a push waiting longer than this (relay drops unclaimed rooms ~3h)
@@ -101,10 +95,13 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
     fi
     v="${v:-ok}"
   fi
-  if [ -d "$dir/.git" ]; then local unsent dirty
-    unsent="$(git -C "$dir" rev-list --count refs/share/sent..HEAD 2>/dev/null || git -C "$dir" rev-list --count HEAD 2>/dev/null || echo 0)"
-    dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
-    [ "$unsent" = 0 ] || d="$d, unsent $unsent"; [ "$dirty" = 0 ] || d="$d, dirty $dirty"
+  if [ -f "$dir/.share/manifest" ]; then local pending siblings tombstones
+    if [ -f "$dir/.share/peer/$f.pushed" ]; then
+      pending="$(awk 'FILENAME==ARGV[1]{seen[$0]=1;next}!($0 in seen){n++}END{print n+0}' "$dir/.share/peer/$f.pushed" "$dir/.share/manifest")"
+    else pending="$(wc -l < "$dir/.share/manifest" | tr -d ' ')"; fi
+    siblings="$(cut -f1 "$dir/.share/manifest" | sort | uniq -d | wc -l | tr -d ' ')"
+    tombstones="$(awk -F '\t' '$2=="-"{n++}END{print n+0}' "$dir/.share/manifest")"
+    d="$d, pending $pending, siblings $siblings, tombstones $tombstones"
     local dpct dfree; read -r dpct dfree < <(df -Pk "$dir" 2>/dev/null | awk 'NR==2{sub("%","",$5); print $5, int($4/1024)}')
     # loud only on free space (what the fence uses): APFS reports purgeable space as used, so a percentage alone misleads
     if [ "${dfree:-999999}" -lt "${SHARE_DISK_RESERVE_MB:-1024}" ]; then d="$d, DISK LOW ${dfree}MB free (${dpct}% used)"
@@ -159,9 +156,8 @@ case "$sub" in
     shift; f=""; n=20; while [ $# -gt 0 ]; do case "$1" in --friend|-f) f="${2:?}"; shift 2;; [0-9]*) n="$1"; shift;; *) shift;; esac; done
     [ -n "$f" ] || { echo "usage: share sync history --friend NAME [N]" >&2; exit 1; }
     info "$f"; hd="${dir:-${SHARE_PULL_DIR:-$HOME/share}/$f}"
-    [ -d "$hd/.git" ] || { echo "share sync: no sync history at $hd" >&2; exit 1; }
-    # mine = commits made here; theirs arrive inside merge commits — --first-parent keeps the local timeline
-    git -C "$hd" log -"$n" --date=format:'%m-%d %H:%M' --pretty='%ad  %s' --name-status | sed '/^$/d'
+    [ -f "$hd/.share/history" ] || { echo "share sync: no sync history at $hd" >&2; exit 1; }
+    tail -n "$n" "$hd/.share/history" | awk -F '\t' '{t=substr($1,6,11);sub(/T/," ",t);printf "%s  %s  %s %s\n",t,$2,$3,$4}'
     exit 0;;
 esac
 
@@ -179,9 +175,8 @@ esac; done
 if [ -z "$role" ] && [ -f "$cfgd/$f" ]; then read -r srole severy sdir < "$cfgd/$f"; role="$srole"; d="${d:-$sdir}"; every="${every:-$severy}"; fi
 { [ "$role" = a ] || [ "$role" = b ]; } || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]   (no saved config for $f yet)" >&2; exit 1; }
 every="${every:-15}"
-command -v git >/dev/null || { echo "share sync: needs the git binary (no account or remote — local repo only). macOS: xcode-select --install" >&2; exit 1; }
 code -f "$f" >/dev/null   # fail on unknown friend BEFORE daemonizing
-d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"
+d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"; d="$(cd "$d" && pwd -P)"
 pidf="$tmp/share-sync-$f.pid"; lg="$tmp/share-sync-$f.log"
 mkdir -p "$cfgd"; printf '%s %s %s\n' "$role" "$every" "$d" > "$cfgd/$f"
 
@@ -203,7 +198,7 @@ if [ -z "$fg" ]; then
   exit 0
 fi
 
-# --- git-backed engine (foreground) ---
+# --- CRDT engine (foreground) ---
 if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in_="sync-a2b"; fi
 printf '%s %s %s %s\n' "$$" "$role" "$d" "$lg" > "$pidf"
 stage="$tmp/share-sync-$f-in"; mkdir -p "$stage"
@@ -214,7 +209,6 @@ pushlog="$tmp/share-sync-$f.pushlog" # the open push's own output (croc's progre
 rmdir "$lk" 2>/dev/null || true; rm -f "$pushf" "$resetf" "$pushlog"   # a fresh daemon owns the repo — leftovers of a dead one must not block it
 
 log()    { printf 'share sync: %s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-G()      { git -C "$d" "$@"; }
 # A lock held >10 min is a corpse (a loop killed mid-critical-section) — break it rather than hang every loop forever.
 lock()   { until mkdir "$lk" 2>/dev/null; do ! older "$lk" 10 || { rmdir "$lk" 2>/dev/null && log "broke a stale lock (held >10m)"; }; sleep 0.2; done; }
 unlock() { rmdir "$lk" 2>/dev/null || true; }
@@ -225,64 +219,37 @@ kill_tree() { local c kids; kids="$(pgrep -P "$1" 2>/dev/null || true)"; kill "$
 # gives the loop a plain exit status, and bash's "Terminated" report lands in the wrapper, not in the log.
 kill_grandkids() { local w c; for w in $(pgrep -P "$1" 2>/dev/null); do for c in $(pgrep -P "$w" 2>/dev/null); do kill_tree "$c"; done; done; }
 
-if [ ! -d "$d/.git" ]; then
-  git init -q "$d"
-  [ -f "$d/.gitattributes" ] || printf '*.md merge=union\n*.txt merge=union\n' > "$d/.gitattributes"
-fi
-# local identity so commits work with zero git setup — never touches global config
-G config user.email >/dev/null 2>&1 || { G config user.name "share-sync"; G config user.email "sync@share.local"; }
-# compaction policy: consolidate early (default git waits for 50 packs), inline so it runs under our lock
-G config gc.autoPackLimit "${SHARE_GC_PACKS:-8}"; G config gc.autoDetach false
-big_mb="${SHARE_BIG_MB:-20}"; reserve_mb="${SHARE_DISK_RESERVE_MB:-1024}"
+reserve_mb="${SHARE_DISK_RESERVE_MB:-1024}"
 free_kb() { df -Pk "$d" 2>/dev/null | awk 'NR==2{print $4}'; }
-packs()   { ls "$d/.git/objects/pack"/*.pack 2>/dev/null | wc -l | tr -d ' '; }
-
-# `git add` can lose the race with an editor mid-write ("short read while indexing") —
-# retry, then skip this tick. Never fatal: one bad tick must not take a loop down.
-commit_dirty() {
-  local i; for i in 1 2 3; do
-    G add -A >/dev/null 2>&1 && break
-    [ "$i" = 3 ] && { log "git add failed (file mid-write?) — skipping this tick"; return 0; }; sleep 1
-  done
-  G diff --cached --quiet 2>/dev/null && return 0
-  G commit -qm "sync: $(date -u +%FT%TZ) $(hostname -s)" >/dev/null 2>&1 || { log "git commit failed — will retry next tick"; return 0; }
-  # big binaries never delta: every peer keeps every version forever — say so once, at the commit that adds it
-  local p sz; while IFS= read -r p; do
-    [ -n "$p" ] || continue; sz="$(G cat-file -s "HEAD:$p" 2>/dev/null || echo 0)"
-    [ "$sz" -lt $((big_mb * 1048576)) ] || log "large file $((sz / 1048576))MB: $p — binaries carry no deltas; ignore it or keep it out of the synced tree"
-  done < <(G diff-tree --no-commit-id -r --diff-filter=AM --name-only HEAD 2>/dev/null)
-}
-
-# The loops run with errexit OFF: a failing git call must log and move on, not exit
-# the subshell holding the lock (which deadlocked the other loop forever).
+init_state
+# Keep the existing per-friend lock for this change; never run two friends
+# against one folder. A folder lock needs ownership-aware watchdog recovery.
+# Errexit is off inside loops: a failed operation must never strand the lock.
 pusher() {
   set +e
-  bd="$tmp/share-sync-$f-out"; mkdir -p "$bd"; bf="$bd/share-sync-v1.bundle"   # payload name IS the protocol version
+  bd="$tmp/share-sync-$f-out"; mkdir -p "$bd"; bf="$bd/share-sync-v2.tar"   # payload name IS the protocol version
   while :; do
-    lock; commit_dirty
-    head="$(G rev-parse -q --verify HEAD 2>/dev/null || true)"
-    sent="$(G rev-parse -q --verify refs/share/sent 2>/dev/null || true)"
-    if [ -n "$head" ] && [ "$head" != "$sent" ]; then
-      # only what they lack: everything reachable from HEAD but not from their last-received HEAD
-      theirs="$(G rev-parse -q --verify refs/share/theirs 2>/dev/null || true)"
-      if [ -n "$theirs" ] && [ "$(G rev-list --count HEAD --not "$theirs" 2>/dev/null || echo 1)" = 0 ]; then
-        G update-ref refs/share/sent "$head"; unlock; log "nothing to push — $f already has ${head:0:7}"; continue
-      fi
-      if [ "$(free_kb)" -lt $((reserve_mb * 1024)) ]; then unlock; log "DISK LOW — $(($(free_kb) / 1024))MB free < ${reserve_mb}MB reserve; not bundling, retrying in ${every}s"; sleep "$every"; continue; fi
-      if ! G bundle create "$bf" HEAD ${theirs:+--not "$theirs"} >/dev/null 2>&1; then unlock; log "bundle create failed — retrying in ${every}s"; sleep "$every"; continue; fi
+    lock; scan; retain_blobs
+    head="$(hash_file "$state/manifest")"
+    sent="$(cat "$state/peer/$f.sent" 2>/dev/null)"
+    now="$(date +%s)"; lastpush="$(cat "$state/peer/$f.time" 2>/dev/null || echo 0)"
+    if [ "$head" != "$sent" ] || [ $((now-lastpush)) -ge "${SHARE_SYNC_HEARTBEAT:-180}" ]; then
+      if [ "$(free_kb)" -lt $((reserve_mb * 1024)) ]; then unlock; log "DISK LOW — reserve ${reserve_mb}MB; retrying"; sleep "$every"; continue; fi
+      if ! make_payload; then unlock; log "payload create failed — retrying"; sleep "$every"; continue; fi
       unlock
       t0="$(date +%s)"
       printf '%s %s %s\n' "$t0" "$head" "$(date -u +%F)" > "$pushf"
       # croc prints today's code into this log: owner-only (a world-readable /tmp file would hand it to local users)
       rm -f "$pushlog"; (umask 077; : > "$pushlog")
-      # blocks until they pull — that block is the delivery ack (the watchdog bounds the wait: see pmax; a transfer
+      # Blocks until they pull; success is only a scheduling hint, not an ack.
+      # The watchdog bounds the wait: see pmax; a transfer
       # in flight is bounded by progress instead: see pstall).
       # Wrapper + wait: a watchdog kill is a plain exit status (see kill_grandkids). A reset flag outranks
       # an exit 0 — croc exits 0 when killed, and that must never count as delivered.
       bash -c 'push "$@"; exit $?' _ --friend "$f" --salt "$out" "$bf" >>"$pushlog" 2>&1 &
       if wait "$!" && [ ! -f "$resetf" ]; then
-        rm -f "$pushf" "$pushlog"; lock; G update-ref refs/share/sent "$head"; unlock
-        log "pushed ${head:0:7} ($(du -k "$bf" 2>/dev/null | cut -f1)KB${theirs:+, since ${theirs:0:7}}) in $(ago $(($(date +%s) - t0)))"
+        rm -f "$pushf" "$pushlog"; lock; printf '%s\n' "$head" > "$state/peer/$f.sent"; date +%s > "$state/peer/$f.time"; cp "$bd/snapshot" "$state/peer/$f.pushed"; unlock
+        log "pushed ${head:0:7} ($(du -k "$bf" 2>/dev/null | cut -f1)KB) in $(ago $(($(date +%s) - t0)))"
       elif [ -f "$resetf" ]; then rm -f "$pushf" "$pushlog"; log "push reopened — $(cat "$resetf")"; rm -f "$resetf"
       else rm -f "$pushf" "$pushlog"; log "push failed — retrying in ${every}s"; sleep "$every"; fi
     else unlock; sleep "$every"; fi
@@ -297,35 +264,20 @@ puller() {
     bash -c 'pull "$@"; exit $?' _ --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1 &
     if wait "$!"; then
       [ -z "$pfail" ] || { log "pull recovered"; pfail=""; }
-      bundle="$stage/share-sync-v1.bundle"
+      bundle="$stage/share-sync-v2.tar"
       if [ ! -f "$bundle" ]; then
-        log "INCOMPATIBLE PEER — $f sent $(ls "$stage" | head -3 | paste -sd, -) instead of share-sync-v1.bundle; both sides must run the same major version: brew upgrade share"
+        log "INCOMPATIBLE PEER — $f sent $(ls "$stage" | head -3 | paste -sd, -) instead of share-sync-v2.tar; upgrade both sides together: brew upgrade share"
         sleep "$every"; continue
       fi
       bkb="$(du -k "$bundle" 2>/dev/null | cut -f1)"; fkb="$(free_kb)"
-      if [ "${fkb:-0}" -lt $((bkb * 3 + reserve_mb * 1024)) ]; then
-        log "DISK LOW — $((fkb / 1024))MB free, bundle $((bkb / 1024))MB needs 3x + ${reserve_mb}MB reserve; skipped (their next push re-covers it) — free space, then: share sync check --repair"
+      if [ "${fkb:-0}" -lt $((bkb * 2 + reserve_mb * 1024)) ]; then
+        log "DISK LOW — $((fkb / 1024))MB free, bundle $((bkb / 1024))MB needs 2x + ${reserve_mb}MB reserve; skipped (their next push re-covers it) — free space, then: share sync check --repair"
         sleep "$every"; continue
       fi
-      lock; commit_dirty
-      if ! G fetch -q "$bundle" HEAD 2>/dev/null; then log "bad bundle — skipped (their next push re-covers it)"; unlock; continue; fi
-      G update-ref refs/share/theirs FETCH_HEAD 2>/dev/null   # the basis of our next bundle to them
-      if ! G rev-parse -q --verify HEAD >/dev/null 2>&1; then
-        G reset -q --hard FETCH_HEAD; log "adopted their history"
-      elif G merge -q -m "sync: received from $f" --allow-unrelated-histories FETCH_HEAD >/dev/null 2>&1; then
-        log "merged theirs: $(G diff --name-only 'HEAD@{1}' HEAD 2>/dev/null | paste -sd, - | cut -c1-120)"
-      else
-        # union handled text conflicts; leftovers keep OURS, save THEIRS beside — nothing dropped
-        while IFS= read -r p; do
-          [ -n "$p" ] || continue
-          G show ":3:$p" > "$d/$p.conflict-$(date +%F-%H%M%S)" 2>/dev/null || true
-          G checkout --ours -- "$p" 2>/dev/null || true
-        done < <(G diff --name-only --diff-filter=U)
-        G add -A; G commit -qm "sync: conflict — kept ours, saved theirs as .conflict-*"
-        log "merged with conflict copies"
-      fi
-      pb="$(packs)"; G gc --auto -q >/dev/null 2>&1; pa="$(packs)"
-      [ "$pb" = "$pa" ] || log "compacted $pb packs -> $pa (.git $(du -sk "$d/.git" 2>/dev/null | cut -f1 | awk '{if ($1 >= 1024) printf "%.1fMB", $1/1024; else printf "%dKB", $1}'))"
+      lock
+      if receive_payload "$bundle"; then log "merged state from $f"
+      else log "bad v2 payload — skipped; missing content will be retried"; fi
+
       unlock
     else
       # pull fails hard only when croc itself fails (relay unreachable, bad binary) — say so once, not every tick
@@ -368,13 +320,13 @@ watch() {
     elif [ "$age" -gt "$pmax" ]; then reset_push "waited $(ago "$age") > cap $(ago "$pmax") (relay drops unclaimed rooms ~3h)"
     elif [ "$pday" != "$(date -u +%F)" ]; then reset_push "code rotated at UTC midnight while waiting $(ago "$age")"; fi
   fi
-  if [ $((now - lastc)) -ge "$every" ]; then lock; commit_dirty; unlock; lastc="$now"; fi
+  if [ $((now - lastc)) -ge "$every" ]; then lock; scan; retain_blobs; unlock; lastc="$now"; fi
   if [ $((now - lastu)) -ge 86400 ]; then "$sharebin" update --auto >/dev/null 2>&1 & lastu="$now"; fi
   if [ $((now - lastv)) -ge "${SHARE_FOLLOW_EVERY:-60}" ]; then lastv="$now"; follow; fi
   touch "$pidf" 2>/dev/null || true
 }
 
-log "$d <-> $f (role $role, every ${every}s, git-merged, push cap $(ago "$pmax"), share ${ver:-?})"
+log "$d <-> $f (role $role, every ${every}s, CRDT, push cap $(ago "$pmax"), share ${ver:-?})"
 pusher & pp=$!
 puller & lp=$!
 trap 'kill "$pp" "$lp" 2>/dev/null; unlock; exit 0' INT TERM

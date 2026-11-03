@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Two real daemons over a hermetic croc mailbox; delivery need not be reliable.
+set -euo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"; share="$repo/share"
+W="${1:-$(mktemp -d)}"; mkdir -p "$W"/{a,b,ta,tb,cfg,queue}
+export PATH="$repo/test/stub:$PATH" STUB_MODE=queue STUB_QUEUE="$W/queue"
+export XDG_CONFIG_HOME="$W/cfg" SHARE_SECRET_CRDTA="crdt-$$" SHARE_SECRET_CRDTB="crdt-$$"
+export SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EVERY=3600 SHARE_SYNC_HEARTBEAT=3 SHARE_DISK_RESERVE_MB=1
+A() { TMPDIR="$W/ta" "$share" sync "$@"; }
+B() { TMPDIR="$W/tb" "$share" sync "$@"; }
+stop() { A stop --friend crdtb >/dev/null 2>&1 || true; B stop --friend crdta >/dev/null 2>&1 || true; }
+trap stop EXIT
+start() { A --friend crdtb --role a --dir "$W/a" --every 1 >/dev/null; B --friend crdta --role b --dir "$W/b" --every 1 >/dev/null; }
+fail() { echo "FAIL: $* ($W)"; tail -n 30 "$W/ta/share-sync-crdtb.log" "$W/tb/share-sync-crdta.log"; exit 1; }
+wait_for() { local i; for i in $(seq 1 90); do if "$@" 2>/dev/null; then return 0; fi; sleep 0.3; done; fail "$*"; }
+equal() { [ -f "$W/a/$1" ] && [ -f "$W/b/$1" ] && cmp -s "$W/a/$1" "$W/b/$1"; }
+trees_equal() { diff -r --exclude=.share --exclude=.git "$W/a" "$W/b" >/dev/null; }
+conflict_converged() {
+  [ "$(find "$W/a" -name "$1" | wc -l)" -eq 1 ] &&
+    [ "$(find "$W/b" -name "$1" | wc -l)" -eq 1 ] && trees_equal
+}
+pass() { echo "  ok $*"; }
+start
+echo hello > "$W/a/hello.txt"; wait_for equal hello.txt
+echo reply > "$W/b/reply.txt"; wait_for equal reply.txt; pass 'round trips'
+rm "$W/a/reply.txt"; wait_for test ! -e "$W/b/reply.txt"; pass deletes
+touch "$STUB_QUEUE/drop"; echo lost > "$W/a/lost.bin"; wait_for equal lost.bin; pass 'dropped payload retry'
+touch "$STUB_QUEUE/duplicate"; echo twice > "$W/b/twice.bin"; wait_for equal twice.bin
+sleep 2; wait_for trees_equal; pass 'duplicate payload idempotence'
+# Stop transport on both sides to create genuinely concurrent edits.
+stop; printf 'base\n' > "$W/a/data.bin"; start; wait_for equal data.bin
+stop; printf 'alice\000binary\n' > "$W/a/data.bin"; printf 'bob\000binary\n' > "$W/b/data.bin"
+start; wait_for conflict_converged 'data.conflict-*.bin'
+pass 'concurrent binaries preserve both versions and converge'
+printf 'one\ntwo\nthree\nfour\nfive\n' > "$W/a/clean.txt"; wait_for equal clean.txt
+stop; printf 'ONE\ntwo\nthree\nfour\nfive\n' > "$W/a/clean.txt"; printf 'one\ntwo\nthree\nfour\nFIVE\n' > "$W/b/clean.txt"
+start; wait_for grep -q ONE "$W/b/clean.txt"; wait_for grep -q FIVE "$W/a/clean.txt"; wait_for trees_equal
+pass 'elected clean text merge'
+printf 'base\n' > "$W/a/overlap.md"; wait_for equal overlap.md
+stop; echo alice > "$W/a/overlap.md"; echo bob > "$W/b/overlap.md"; start; wait_for conflict_converged 'overlap.conflict-*.md'
+pass 'overlapping text preserves both versions'
+printf 'initial\n' > "$W/a/during.bin"; wait_for equal during.bin
+touch "$STUB_QUEUE/pause"
+printf 'sender edit\n' > "$W/a/during.bin"; sleep 2
+printf 'receiver edit\n' > "$W/b/during.bin"; sleep 6
+rm "$STUB_QUEUE/pause"; wait_for conflict_converged 'during.conflict-*.bin'
+grep -rl 'sender edit' "$W/a" --exclude-dir=.share >/dev/null || fail 'sender edit lost'
+grep -rl 'receiver edit' "$W/a" --exclude-dir=.share >/dev/null || fail 'mid-transfer edit lost'
+pass 'editing during a blocked transfer preserves both edits'
+dd if=/dev/zero of="$W/a/large.bin" bs=1048576 count=50 2>/dev/null; wait_for equal large.bin
+for i in 1 2 3; do printf '%s' "$i" | dd of="$W/a/large.bin" bs=1 seek=100 conv=notrunc 2>/dev/null; wait_for equal large.bin; done
+sleep 3
+for side in a b; do
+  kb="$(du -sk "$W/$side/.share" | cut -f1)"; [ "$kb" -lt 60000 ] || fail "state growth: $side $kb KB"
+done
+pass '50MB versions do not accumulate'
+A status > "$W/status"
+grep -qE 'crdtb +role a +(ok|waiting-peer|sending)' "$W/status" || fail "status: $(cat "$W/status")"
+A check --friend crdtb >/dev/null || fail check
+A history --friend crdtb 5 | grep -E ' [AMDC] ' >/dev/null || fail history
+pass 'status, check, history'
+stop
+rm -rf "$STUB_QUEUE"; mkdir -p "$STUB_QUEUE"
+B --friend crdta --role b --dir "$W/b" --every 1 >/dev/null
+echo old > "$W/share-sync-v1.bundle"
+CROC_SECRET="$("$share" code --friend crdta --salt sync-a2b)" croc --yes send "$W/share-sync-v1.bundle" > "$W/v1-send.log" 2>&1 & sender=$!
+wait_for grep -q 'INCOMPATIBLE PEER.*upgrade both sides' "$W/tb/share-sync-crdta.log"
+wait "$sender"
+pass 'v1 payload refused loudly'
+echo "CRDT e2e passed ($W)"

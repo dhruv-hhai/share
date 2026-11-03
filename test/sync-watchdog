@@ -44,6 +44,6 @@ stop
 start stall SHARE_PUSH_MAX=4 SHARE_PUSH_STALL=5
 until_ok 25 grep -q 'push reopened — transfer stalled — no progress' "$W/t/share-sync-bob.log" || fail "stalled transfer not reopened"
 pass "stalled transfer reopened"
-[ -z "$(git -C "$W/d" rev-parse -q --verify refs/share/sent 2>/dev/null)" ] || fail "stalled push must not count as delivered"
+[ ! -f "$W/d/.share/peer/bob.sent" ] || fail "stalled push must not count as delivered"
 pass "stalled push not marked sent"
 echo "all watchdog checks passed"

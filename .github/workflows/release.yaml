@@ -110,7 +110,7 @@ jobs:
             depends_on "croc"
 
             def install
-              libexec.install "share", "tools"
+              libexec.install "share", "tools", "lib"
               bin.install_symlink libexec/"share"
             end
 
