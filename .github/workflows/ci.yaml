@@ -34,7 +34,7 @@ jobs:
       - name: shellcheck
         run: |
           command -v shellcheck || sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning share install tools/*
+          shellcheck -S warning share install tools/* lib/*.sh test/sync-* test/stub/croc
 
       - name: actionlint
         run: |
@@ -128,3 +128,24 @@ jobs:
             echo "$help_out" | grep -q "share $name" || { echo "::error::$name missing from dispatcher help"; exit 1; }
             ./share "$name" --help | grep -qi usage || { echo "::error::$name --help has no usage line"; exit 1; }
           done
+
+  crdt:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Algebra and filesystem safety
+        run: |
+          /bin/bash test/sync-merge
+          /bin/bash test/sync-files
+      - name: Two daemons with lossy and duplicated delivery
+        run: /bin/bash test/sync-crdt-e2e
+      - name: Watchdog preservation
+        run: /bin/bash test/sync-watchdog
+      - name: v1 migration and rollback
+        run: /bin/bash test/sync-migration

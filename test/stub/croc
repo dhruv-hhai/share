@@ -4,6 +4,29 @@
 #   STUB_CONNECT_AFTER  seconds before the peer "connects" (default 1)
 #   STUB_DURATION       seconds of progress for transfer mode (default 20)
 [ "${1:-}" = --version ] && { echo "croc stub"; exit 0; }
+if [ "${STUB_MODE:-}" = queue ]; then
+  room="$STUB_QUEUE/$CROC_SECRET"; mkdir -p "$room"
+  case " $* " in
+    *" send "*)
+      for file in "$@"; do :; done
+      while [ -e "$room/ready" ]; do sleep 0.1; done
+      if [ -f "$STUB_QUEUE/drop" ]; then rm -f "$STUB_QUEUE/drop"; exit 0; fi
+      cp "$file" "$room/payload.new" || exit 1
+      printf '%s\n' "${file##*/}" > "$room/name"
+      mv "$room/payload.new" "$room/payload"
+      if [ -f "$STUB_QUEUE/duplicate" ]; then cp "$room/payload" "$room/again"; rm -f "$STUB_QUEUE/duplicate"; fi
+      touch "$room/ready"
+      printf '\nSending (->stub)\n' >&2
+      while [ -e "$room/ready" ]; do printf '\r transferring' >&2; sleep 0.1; done
+      exit 0;;
+    *)
+      while [ ! -f "$room/ready" ]; do sleep 0.1; done
+      while [ -f "$STUB_QUEUE/pause" ]; do sleep 0.1; done
+      cp "$room/payload" "$(cat "$room/name")" || exit 1
+      if [ -f "$room/again" ]; then mv "$room/again" "$room/payload"; else rm -f "$room/ready"; fi
+      exit 0;;
+  esac
+fi
 case " $* " in
   *" send "*)
     echo "Sending 'share-sync-v1.bundle' (1.0 MB)" >&2

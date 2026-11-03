@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Pure state operations shared by the daemon and hermetic tests.
+# shellcheck disable=SC2154
 sync_merge() { LC_ALL=C sort -u "$@" | LC_ALL=C awk -f "$sync_lib/sync-merge.awk"; }
 # Join clocks, optionally increment this replica. Sorted output is canonical.
 sync_clock() {

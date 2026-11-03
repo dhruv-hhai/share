@@ -8,7 +8,7 @@ share="$(cd "$(dirname "$0")/.." && pwd)/share"
 W="${1:-$(mktemp -d)}"; mkdir -p "$W"/{a,b,ta,tb,cfg}
 export XDG_CONFIG_HOME="$W/cfg" SHARE_SECRET_ALICE="e2e-sync-$$" SHARE_SECRET_BOB="e2e-sync-$$"
 export SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EVERY=2   # no network/brew from the daemons; version-follow every 2s instead of 60
-export SHARE_GC_PACKS=1 SHARE_DISK_RESERVE_MB=64  # compact on every pull so the e2e sees it; small reserve (WORKDIR may be a small tmpfs)
+export SHARE_DISK_RESERVE_MB=64 SHARE_SYNC_HEARTBEAT=10
 repo="$(cd "$(dirname "$0")/.." && pwd)"; e2etag="v99.99.99-e2e"
 A() { TMPDIR="$W/ta" "$share" sync "$@"; }      # alice's machine: friend = bob, role a, dir $W/a
 B() { TMPDIR="$W/tb" "$share" sync "$@"; }      # bob's machine:   friend = alice, role b, dir $W/b
@@ -30,26 +30,25 @@ A status | grep -E '^bob +role a +(ok|waiting-peer|sending) ' || fail "status ve
 until_ok 30 A check --friend bob >/dev/null || fail "check exit 0 when healthy"; pass "check --friend exits 0 when healthy"
 grep -q '^a 2 ' "$W/cfg/share/sync/bob" || fail "saved config: $(cat "$W/cfg/share/sync/bob")"; pass "config saved (role every dir)"
 
-# hygiene: bundles are incremental (basis = their last-received HEAD), big files are called out, packs get compacted
-until_ok 30 git -C "$W/a" rev-parse -q --verify refs/share/theirs >/dev/null || fail "refs/share/theirs after a pull"; pass "refs/share/theirs recorded on pull"
+# Peer manifests are bandwidth hints; large files are called out during scan.
+until_ok 30 test -f "$W/a/.share/peer/bob.manifest" || fail "peer manifest after a pull"; pass "peer manifest recorded on pull"
 echo "third exchange" > "$W/a/three.md"
 until_ok 180 test -f "$W/b/three.md" || fail "a→b third exchange"
-grep -q 'pushed [0-9a-f]* ([0-9]*KB, since [0-9a-f]*)' "$W/ta/share-sync-bob.log" || fail "incremental push: $(grep pushed "$W/ta/share-sync-bob.log")"; pass "pushes are incremental"
+grep -q 'pushed [0-9a-f]* ([0-9]*KB)' "$W/ta/share-sync-bob.log" || fail "push log"; pass "manifest pushes recorded"
 dd if=/dev/zero of="$W/a/blob.bin" bs=1048576 count=21 2>/dev/null
 until_ok 120 grep -q 'large file 21MB: blob.bin' "$W/ta/share-sync-bob.log" || fail "large file warning"; pass "large file warned at commit"
 until_ok 180 test -f "$W/b/blob.bin" || fail "large file delivered"
-# small bundles may unpack to loose objects rather than packs, so assert the outcome, not the log line: never more than limit+1 packs
-np="$(ls "$W/b/.git/objects/pack"/*.pack 2>/dev/null | wc -l | tr -d ' ')"; [ "$np" -le 2 ] || fail "compaction: $np packs in bob's repo (limit 1)"; pass "received history stays compact ($np pack(s))"
+[ ! -d "$W/b/.git" ] || fail "v2 created .git"; pass "no git object store"
 A status | grep -qE 'disk|DISK' && pass "status reports disk use" || pass "status: disk under 80%, nothing to report"
 
 # bob offline: alice's push blocks at the relay; her edits must still get committed; the watchdog must reopen the push past the cap
 B stop --friend alice >/dev/null
 echo "written while bob is offline" > "$W/a/offline.md"
-until_ok 30 sh -c "git -C '$W/a' log --oneline -- offline.md | grep -q . && [ -z \"\$(git -C '$W/a' status --porcelain)\" ]" || fail "edit committed while push blocked"; pass "edit committed while push blocked (committer tick)"
-until_ok 60 bash -c "TMPDIR='$W/ta' '$share' sync check --friend bob | grep -q 'waiting-peer.*push waiting.*unsent'" || fail "waiting-peer verdict: $(A check --friend bob)"
-pass "verdict waiting-peer with push age + unsent count"
+until_ok 30 grep -q '^offline.md' "$W/a/.share/manifest" || fail "edit versioned while push blocked"; pass "edit versioned while push blocked (scan tick)"
+until_ok 60 bash -c "TMPDIR='$W/ta' '$share' sync check --friend bob | grep 'waiting-peer.*push waiting.*pending'" || fail "waiting-peer verdict: $(A check --friend bob)"
+pass "verdict waiting-peer with push age + pending count"
 until_ok 60 grep -q 'push reopened — waited .* > cap' "$W/ta/share-sync-bob.log" || fail "watchdog push cap"; pass "watchdog reopened a push past the cap"
-[ "$(git -C "$W/a" rev-parse refs/share/sent)" != "$(git -C "$W/a" rev-parse HEAD)" ] || fail "reopen must not count as delivered (sent == HEAD)"; pass "reopened push not marked sent"
+! cmp -s "$W/a/.share/peer/bob.pushed" "$W/a/.share/manifest" || fail "reopen must not count as pushed"; pass "reopened push not marked sent"
 grep -q 'Terminated' "$W/ta/share-sync-bob.log" && fail "bash kill noise in log"; pass "no kill noise in log"
 
 # stale lock left by a dead loop is broken, not waited on forever
