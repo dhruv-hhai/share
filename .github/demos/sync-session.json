@@ -1,0 +1,35 @@
+{
+  "note": "Real commands and output; isolated homes, pre-paired demo friends, local croc relay. Home paths abbreviated; waits omitted.",
+  "events": [
+    {
+      "side": "a",
+      "command": "share sync --friend demo-bob --role a --dir ~/notes",
+      "output": "share sync: demo-bob (role a) syncing ~/notes in the background (pid 2543356)\nshare sync:   log:    share sync log --friend demo-bob\nshare sync:   health: share sync check --friend demo-bob      stop: share sync stop --friend demo-bob"
+    },
+    {
+      "side": "b",
+      "command": "share sync --friend demo-alice --role b --dir ~/notes",
+      "output": "share sync: demo-alice (role b) syncing ~/notes in the background (pid 2543413)\nshare sync:   log:    share sync log --friend demo-alice\nshare sync:   health: share sync check --friend demo-alice      stop: share sync stop --friend demo-alice"
+    },
+    {
+      "side": "a",
+      "command": "echo 'Tea at 4?' > ~/notes/plan.txt",
+      "output": ""
+    },
+    {
+      "side": "b",
+      "command": "cat ~/notes/plan.txt",
+      "output": "Tea at 4?"
+    },
+    {
+      "side": "b",
+      "command": "echo 'See you at 4!' >> ~/notes/plan.txt",
+      "output": ""
+    },
+    {
+      "side": "a",
+      "command": "cat ~/notes/plan.txt",
+      "output": "Tea at 4?\nSee you at 4!"
+    }
+  ]
+}
