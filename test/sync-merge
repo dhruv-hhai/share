@@ -4,6 +4,8 @@ set -euo pipefail
 sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
 # shellcheck source=../lib/sync-state.sh
 . "$sync_lib/sync-state.sh"
+# shellcheck source=../lib/sync-files.sh
+. "$sync_lib/sync-files.sh"
 w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
 check() {
   sync_merge "$w/a" "$w/b" > "$w/ab"
@@ -24,6 +26,19 @@ printf 'p\tz\t-\ta:3\n' > "$w/c"
 check; cmp "$w/c" "$w/left" # resurrection
 printf 'p\t-\t-\tb:1\n' > "$w/c"
 check # concurrent deletes, concurrent edit/delete
+# Fixed three-way concurrency and deterministic materialization from either
+# replica, including edit-over-delete and identical-content visibility.
+printf 'p\tx\t-\ta:1\n' > "$w/a"
+printf 'p\ty\t-\tb:1\n' > "$w/b"
+printf 'p\tz\t-\tc:1\n' > "$w/c"
+check; [ "$(wc -l < "$w/left")" -eq 3 ]
+state="$w/state"; mkdir -p "$state"; cp "$w/left" "$state/manifest"
+make_view > "$w/view-a"; sync_merge "$w/c" "$w/ab" > "$state/manifest"
+make_view > "$w/view-b"; cmp "$w/view-a" "$w/view-b"
+printf 'p\t-\t-\ta:1\np\tx\t-\tb:1\n' > "$state/manifest"
+[ "$(make_view)" = $'p\tx' ]
+printf 'p\tx\t-\ta:1\np\tx\t-\tb:1\n' > "$state/manifest"
+[ "$(make_view)" = $'p\tx' ]
 [ "$(sync_conflict_name dir/notes.md abcdef1234)" = dir/notes.conflict-abcdef12.md ]
 [ "$(sync_conflict_name .config abcdef1234)" = .config.conflict-abcdef12 ]
 printf 'p\tx\t-\ta:2,b:1\np\ty\t-\tb:3\n' | sync_clock c > "$w/clock"

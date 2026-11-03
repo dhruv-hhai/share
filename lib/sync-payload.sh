@@ -31,7 +31,7 @@ receive_payload() {
   awk -F '\t' 'NF!=4{exit 1}
     {for(i=2;i<=3;i++)if($i!="-"&&(length($i)!=64||$i~/[^a-f0-9]/))exit 1
      n=split($4,a,",");if(!n)exit 1;last=""
-     for(i=1;i<=n;i++){if(split(a[i],b,":")!=2||b[1]!~/^[a-f0-9]+$/||b[2]!~/^[0-9]+$/||length(b[2])>12||b[1]<=last)exit 1;last=b[1]}}' "$state/incoming.raw" || return 1
+     for(i=1;i<=n;i++){if(split(a[i],b,":")!=2||b[1]!~/^[a-f0-9]+$/||b[2]!~/^[0-9]+$/||length(b[2])>12||("x" b[1])<=("x" last))exit 1;last=b[1]}}' "$state/incoming.raw" || return 1
   : > "$state/incoming"
   while IFS=$'\t' read -r p h parent vv; do
     safe_path "$p" || return 1

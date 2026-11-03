@@ -48,3 +48,15 @@ echo corrupt > "$w/payload/blobs/$(printf '%064d' 1)"
 tar -cf "$w/corrupt.tar" -C "$w/payload" version replica manifest blobs base
 if receive_payload "$w/corrupt.tar"; then echo 'corrupt blob accepted' >&2; exit 1; fi
 echo 'filesystem: missing and corrupt blobs refused'
+d="$w/safety"; mkdir -p "$d/ignored"; init_state
+printf '*.secret\nignored/\n' > "$d/.shareignore"
+echo skip > "$d/token.secret"; echo skip > "$d/ignored/file"
+echo skip > "$d/.DS_Store"
+echo keep > "$d/name with spaces.txt"; echo keep > "$d/back\\slash.txt"
+echo skip > "$d/"$'tab\tname'; echo skip > "$d/"$'line\nname'
+ln -s "$w/a/hello.txt" "$d/link"
+scan; scan
+[ "$(wc -l < "$state/manifest")" -eq 3 ]
+grep -F 'back\slash.txt' "$state/manifest" >/dev/null
+[ "$(find "$state" -name 'skipped-*' | wc -l)" -eq 2 ]
+echo 'filesystem: ignores, spaces/backslashes, unsupported names and symlinks'
