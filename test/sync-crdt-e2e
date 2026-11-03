@@ -43,7 +43,7 @@ printf 'initial\n' > "$W/a/during.bin"; wait_for equal during.bin
 touch "$STUB_QUEUE/pause"
 printf 'sender edit\n' > "$W/a/during.bin"; sleep 2
 printf 'receiver edit\n' > "$W/b/during.bin"; sleep 6
-rm "$STUB_QUEUE/pause"; wait_for trees_equal
+rm "$STUB_QUEUE/pause"; wait_for conflict_converged 'during.conflict-*.bin'
 grep -rl 'sender edit' "$W/a" --exclude-dir=.share >/dev/null || fail 'sender edit lost'
 grep -rl 'receiver edit' "$W/a" --exclude-dir=.share >/dev/null || fail 'mid-transfer edit lost'
 pass 'editing during a blocked transfer preserves both edits'
