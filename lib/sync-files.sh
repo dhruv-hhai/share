@@ -8,6 +8,7 @@ event() { printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$sta
 ignored() {
   local p="$1" pattern
   case "/$p/" in */.share/*|*/.git/*) return 0;; esac
+  [ "$p" != .shareignore ] || return 1
   case "${p##*/}" in .DS_Store|*.swp|*~|.~lock*|'~$'*|.syncthing.*|*.tmp-share-*) return 0;; esac
   [ -f "$d/.shareignore" ] || return 1
   while IFS= read -r pattern || [ -n "$pattern" ]; do

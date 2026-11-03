@@ -248,7 +248,7 @@ pusher() {
       # an exit 0 — croc exits 0 when killed, and that must never count as delivered.
       bash -c 'push "$@"; exit $?' _ --friend "$f" --salt "$out" "$bf" >>"$pushlog" 2>&1 &
       if wait "$!" && [ ! -f "$resetf" ]; then
-        rm -f "$pushf" "$pushlog"; lock; printf '%s\n' "$head" > "$state/peer/$f.sent"; date +%s > "$state/peer/$f.time"; cp "$bd/build/manifest" "$state/peer/$f.pushed"; unlock
+        rm -f "$pushf" "$pushlog"; lock; printf '%s\n' "$head" > "$state/peer/$f.sent"; date +%s > "$state/peer/$f.time"; cp "$bd/snapshot" "$state/peer/$f.pushed"; unlock
         log "pushed ${head:0:7} ($(du -k "$bf" 2>/dev/null | cut -f1)KB) in $(ago $(($(date +%s) - t0)))"
       elif [ -f "$resetf" ]; then rm -f "$pushf" "$pushlog"; log "push reopened — $(cat "$resetf")"; rm -f "$resetf"
       else rm -f "$pushf" "$pushlog"; log "push failed — retrying in ${every}s"; sleep "$every"; fi

@@ -60,3 +60,9 @@ scan; scan
 grep -F 'back\slash.txt' "$state/manifest" >/dev/null
 [ "$(find "$state" -name 'skipped-*' | wc -l)" -eq 2 ]
 echo 'filesystem: ignores, spaces/backslashes, unsupported names and symlinks'
+printf 'name with spaces.txt\n' >> "$d/.shareignore"
+scan; make_payload
+tar -xOf "$bf" manifest > "$w/filtered"
+! grep -q 'name with spaces.txt' "$w/filtered"
+grep -q '^.shareignore' "$w/filtered"
+echo 'filesystem: new ignores suppress previously tracked outgoing content'

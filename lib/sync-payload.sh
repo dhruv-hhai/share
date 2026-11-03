@@ -5,7 +5,14 @@ make_payload() {
   local build="$bd/build" h p parent vv
   rm -rf "$build"; mkdir -p "$build/blobs" "$build/base"
   printf '2\n' > "$build/version"; cp "$state/replica" "$build/replica"
-  cp "$state/manifest" "$build/manifest"
+  cp "$state/manifest" "$bd/snapshot" || return 1
+  : > "$build/manifest"
+  # A newly added ignore rule must also stop sending previously tracked paths.
+  # Retain their local clocks; ignoring is not a replicated deletion.
+  while IFS=$'\t' read -r p h parent vv; do
+    ignored "$p" && continue
+    printf '%s\t%s\t%s\t%s\n' "$p" "$h" "$parent" "$vv" >> "$build/manifest"
+  done < "$state/manifest"
   { cut -f2 "$state/peer/$f.manifest" 2>/dev/null || true; } | LC_ALL=C sort -u > "$state/peer.hashes"
   while IFS=$'\t' read -r p h parent vv; do
     if [ "$h" != - ] && ! grep -Fxq "$h" "$state/peer.hashes"; then
