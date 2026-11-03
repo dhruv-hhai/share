@@ -49,7 +49,7 @@ init_state() {
     fi
   fi
   rid="$(cat "$state/replica")"
-  for meta in manifest cache history observed; do [ -f "$state/$meta" ] || : > "$state/$meta"; done
+  for meta in manifest cache history observed rescan; do [ -f "$state/$meta" ] || : > "$state/$meta"; done
 }
 path_entries() { SHARE_QUERY_PATH="$1" awk -F '\t' '$1==ENVIRON["SHARE_QUERY_PATH"]' "$state/manifest"; }
 observe_path() {
@@ -97,7 +97,7 @@ scan() {
     read -r size mt inode <<< "$st"
     # Seconds-only BSD stat cannot detect a second write in the same second.
     # Rehash recent files even if their stat tuple matches the previous scan.
-    if [ "$old" = "$st $oldh" ] && [ "$mt" -lt "$(($(date +%s)-2))" ]; then continue; fi
+    if [ "$old" = "$st $oldh" ] && [ "$mt" -lt "$(($(date +%s)-2))" ] && ! grep -Fxq -- "$p" "$state/rescan"; then continue; fi
     cp "$file" "$state/snapshot" || continue
     h="$(hash_file "$state/snapshot")"; after="$(file_stat "$file")"
     [ "$st" = "$after" ] && [ "$h" = "$(hash_file "$file")" ] || continue
@@ -107,6 +107,8 @@ scan() {
       [ "$size" -lt $((${SHARE_BIG_MB:-20}*1048576)) ] || log "large file $((size/1048576))MB: $p"
     fi
     set_cache "$p" "$h" "$st"
+    grep -Fxv -- "$p" "$state/rescan" > "$state/rescan.new" || true
+    mv "$state/rescan.new" "$state/rescan"
   done < <(find "$d" -type d \( -name .share -o -name .git \) -prune -o -type f -print0)
   cp "$state/cache" "$state/cache.before"
   while IFS=$'\t' read -r p size mt inode oldh; do
@@ -181,7 +183,9 @@ materialize() {
     dest="$d/$p"; old="$(cache_row "$p")"; oldh="${old##* }"; oldh="${oldh:--}"
     if [ -f "$dest" ]; then
       st="$(file_stat "$dest")"
-      [ "$old" = "$st $oldh" ] && [ "$(hash_file "$dest")" = "$oldh" ] || continue
+      if [ "$old" != "$st $oldh" ] || [ "$(hash_file "$dest")" != "$oldh" ]; then
+        printf '%s\n' "$p" >> "$state/rescan"; continue
+      fi
     elif [ -e "$dest" ] || [ "$oldh" != - ]; then continue
     fi
     if [ "$h" = "$oldh" ]; then observe_path "$p"; continue; fi

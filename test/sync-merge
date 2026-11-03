@@ -32,7 +32,7 @@ printf 'p\tx\t-\ta:2,b:1\np\ty\t-\tb:3\n' | sync_clock c > "$w/clock"
 awk 'BEGIN{s=71237; for(t=1;t<=300;t++)for(f=1;f<=3;f++)for(i=1;i<=5;i++){
  s=(s*16807)%2147483647; a=s%5; s=(s*16807)%2147483647; b=s%5;
  s=(s*16807)%2147483647; h=s%4;
- printf "%d\t%d\tp%d\t%s\t-\ta:%d,b:%d\n",t,f,i%2,h==0?"-":h,a,b}}' > "$w/corpus"
+ printf "%d\t%d\tp%d\t%s\t-\ta:%d,b:%d\n",t,f,i%2,(h==0?"-":h),a,b}}' > "$w/corpus"
 for t in $(seq 1 300); do
   for f in 1 2 3; do
     awk -F '\t' -v t="$t" -v f="$f" '$1==t&&$2==f{sub(/^[^\t]*\t[^\t]*\t/,"");print}' "$w/corpus" > "$w/raw"
