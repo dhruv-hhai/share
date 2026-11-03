@@ -15,6 +15,10 @@ fail() { echo "FAIL: $* ($W)"; tail -n 30 "$W/ta/share-sync-crdtb.log" "$W/tb/sh
 wait_for() { local i; for i in $(seq 1 90); do if "$@" 2>/dev/null; then return 0; fi; sleep 0.3; done; fail "$*"; }
 equal() { [ -f "$W/a/$1" ] && [ -f "$W/b/$1" ] && cmp -s "$W/a/$1" "$W/b/$1"; }
 trees_equal() { diff -r --exclude=.share --exclude=.git "$W/a" "$W/b" >/dev/null; }
+conflict_converged() {
+  [ "$(find "$W/a" -name "$1" | wc -l)" -eq 1 ] &&
+    [ "$(find "$W/b" -name "$1" | wc -l)" -eq 1 ] && trees_equal
+}
 pass() { echo "  ok $*"; }
 start
 echo hello > "$W/a/hello.txt"; wait_for equal hello.txt
@@ -26,16 +30,14 @@ sleep 2; wait_for trees_equal; pass 'duplicate payload idempotence'
 # Stop transport on both sides to create genuinely concurrent edits.
 stop; printf 'base\n' > "$W/a/data.bin"; start; wait_for equal data.bin
 stop; printf 'alice\000binary\n' > "$W/a/data.bin"; printf 'bob\000binary\n' > "$W/b/data.bin"
-start; wait_for trees_equal
-test "$(find "$W/a" -name 'data.conflict-*.bin' | wc -l)" -eq 1 || fail 'binary conflict missing'
+start; wait_for conflict_converged 'data.conflict-*.bin'
 pass 'concurrent binaries preserve both versions and converge'
 printf 'one\ntwo\nthree\nfour\nfive\n' > "$W/a/clean.txt"; wait_for equal clean.txt
 stop; printf 'ONE\ntwo\nthree\nfour\nfive\n' > "$W/a/clean.txt"; printf 'one\ntwo\nthree\nfour\nFIVE\n' > "$W/b/clean.txt"
 start; wait_for grep -q ONE "$W/b/clean.txt"; wait_for grep -q FIVE "$W/a/clean.txt"; wait_for trees_equal
 pass 'elected clean text merge'
 printf 'base\n' > "$W/a/overlap.md"; wait_for equal overlap.md
-stop; echo alice > "$W/a/overlap.md"; echo bob > "$W/b/overlap.md"; start; wait_for trees_equal
-test "$(find "$W/a" -name 'overlap.conflict-*.md' | wc -l)" -eq 1 || fail 'text conflict missing'
+stop; echo alice > "$W/a/overlap.md"; echo bob > "$W/b/overlap.md"; start; wait_for conflict_converged 'overlap.conflict-*.md'
 pass 'overlapping text preserves both versions'
 printf 'initial\n' > "$W/a/during.bin"; wait_for equal during.bin
 touch "$STUB_QUEUE/pause"
