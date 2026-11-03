@@ -51,8 +51,10 @@ until_ok 60 grep -q 'push reopened — waited .* > cap' "$W/ta/share-sync-bob.lo
 ! cmp -s "$W/a/.share/peer/bob.pushed" "$W/a/.share/manifest" || fail "reopen must not count as pushed"; pass "reopened push not marked sent"
 grep -q 'Terminated' "$W/ta/share-sync-bob.log" && fail "bash kill noise in log"; pass "no kill noise in log"
 
-# stale lock left by a dead loop is broken, not waited on forever
-mkdir -p "$W/ta/share-sync-bob.gitlock"; touch -t "$(date -v-20M +%Y%m%d%H%M 2>/dev/null || date -d '-20 min' +%Y%m%d%H%M)" "$W/ta/share-sync-bob.gitlock"
+# Own the injected lock before aging it. mkdir -p could reuse a live loop's
+# lock, which that loop would normally remove before recovery ever saw it.
+until_ok 30 mkdir "$W/ta/share-sync-bob.gitlock" || fail "acquire stale-lock fixture"
+touch -t "$(date -v-20M +%Y%m%d%H%M 2>/dev/null || date -d '-20 min' +%Y%m%d%H%M)" "$W/ta/share-sync-bob.gitlock"
 until_ok 30 grep -q 'broke a stale lock' "$W/ta/share-sync-bob.log" || fail "stale lock break"; pass "stale lock broken"
 
 # a loop that dies is respawned, daemon stays up

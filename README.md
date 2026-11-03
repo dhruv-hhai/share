@@ -6,6 +6,11 @@ Assign dedicated sharing folders with friends.
 
 # Installation & dependencies
 
+Sync runs on Bash 3.2+, croc, OpenSSL and standard Unix utilities. `diff3` is
+optional for automatic text merging. Background startup uses Bash job control
+and `nohup`; Perl and Python are not required. Git remains in the installer and
+release updater, but is not used by the v2 sync engine.
+
 Dependencies
 - [croc](https://github.com/schollz/croc) 
 - unix shell

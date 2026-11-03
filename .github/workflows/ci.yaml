@@ -148,5 +148,7 @@ jobs:
         run: /bin/bash test/sync-crdt-e2e
       - name: Watchdog preservation
         run: /bin/bash test/sync-watchdog
+      - name: Background daemon without Perl or Python
+        run: /bin/bash test/sync-daemon
       - name: v1 migration and rollback
         run: /bin/bash test/sync-migration

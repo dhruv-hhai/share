@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Portable background launch: no interpreter, independent group, hangup, cleanup.
+set -euo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+W="$(mktemp -d)"; mkdir -p "$W"/{d,t,cfg,bin}
+export TMPDIR="$W/t" XDG_CONFIG_HOME="$W/cfg" SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EVERY=3600
+export SHARE_SECRET_DAEMONCHECK="daemon-test-$$" STUB_MODE=wait INTERPRETER_MARKER="$W/interpreter"
+export PATH="$W/bin:$repo/test/stub:$PATH"
+for interpreter in perl python3; do
+  cat > "$W/bin/$interpreter" <<'EOF'
+#!/bin/sh
+touch "$INTERPRETER_MARKER"
+exit 99
+EOF
+  chmod +x "$W/bin/$interpreter"
+done
+S() { "$repo/share" sync "$@"; }
+cleanup() { S stop --friend daemoncheck >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+wait_for() {
+  local attempt
+  for attempt in $(seq 1 60); do "$@" && return 0; [ "$attempt" = 60 ] || sleep 0.2; done
+  echo "FAIL: $*" >&2; cat "$W/t/share-sync-daemoncheck.log" >&2; return 1
+}
+printf 'before\n' > "$W/d/note.txt"
+S --friend daemoncheck --role a --dir "$W/d" --every 1
+read -r daemon _ < "$W/t/share-sync-daemoncheck.pid"
+pgid="$(ps -p "$daemon" -o pgid= | tr -d ' ')"
+test "$pgid" = "$daemon"
+test "$pgid" != "$(ps -p $$ -o pgid= | tr -d ' ')"
+wait_for test -s "$W/t/share-sync-daemoncheck.pushlog"
+test ! -e "$INTERPRETER_MARKER"
+kill -HUP "$daemon"
+printf 'after hangup\n' > "$W/d/after.txt"
+observed() { grep -q '^after.txt' "$W/d/.share/manifest"; }
+wait_for observed
+# Heartbeat touch can recreate a purged pid file as empty. Both cases must
+# discover the same group, not the caller, and allow complete shutdown.
+: > "$W/t/share-sync-daemoncheck.pid"
+status="$(S status)"
+grep -q "daemoncheck .*pid $daemon" <<< "$status"
+rm "$W/t/share-sync-daemoncheck.pid"
+S stop --friend daemoncheck
+group_gone() { ps -axo pgid=,stat= | awk -v p="$pgid" '$1==p && $2!~/^Z/{live=1}END{exit live}'; }
+wait_for group_gone
+test ! -e "$INTERPRETER_MARKER"
+trap - EXIT
+rm -rf "$W"
+echo 'daemon: isolated group, survives hangup, pid fallback and complete stop; no Perl/Python'

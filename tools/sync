@@ -53,7 +53,7 @@ pstall="${SHARE_PUSH_STALL:-900}"                     # once bytes flow, reopen 
 # Daemons found by process scan, one line per daemon: "PGID FRIEND ROLE". The pid
 # file is the primary record, but macOS purges $TMPDIR files untouched for ~3 days
 # (the daemon touches its own, but older ones lost theirs) — this is the fallback.
-# pgid = the setsid leader = the pid the file would hold; sort -u folds the loop subshells.
+# pgid = the background job leader = the pid the file would hold; sort -u folds the loop subshells.
 daemons_ps() { ps -axo pgid=,command= | sed -n 's/^ *\([0-9][0-9]*\) .*tools\/sync --fg --friend \([^ ]*\) --role \([ab]\).*$/\1 \2 \3/p' | sort -u; }
 # GNU first: GNU `stat -f` means --file-system and prints a block of text before failing, which the BSD-first order
 # captured as the "mtime" on Linux. BSD `stat -c` fails cleanly with nothing on stdout.
@@ -73,7 +73,7 @@ friends_known() { { for p in "$tmp"/share-sync-*.pid; do [ -f "$p" ] && { p="$(b
                     for c in "$cfgd"/*; do [ -f "$c" ] && basename "$c"; done; } 2>/dev/null | sort -u; }
 # info F -> pid (empty if not running), role, dir — from the pid file, falling back to ps and the saved config.
 info() { pid=""; role=""; dir=""; local pf="$tmp/share-sync-$1.pid"
-  [ ! -f "$pf" ] || read -r pid role dir _ < "$pf"
+  [ ! -f "$pf" ] || read -r pid role dir _ < "$pf" || pid=""
   { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || pid="$(daemons_ps | awk -v f="$1" '$2==f{print $1; exit}')"
   [ -n "$role" ] || { [ ! -f "$cfgd/$1" ] || read -r role _ dir < "$cfgd/$1"; }; }
 # health F -> "VERDICT<TAB>DETAIL<TAB>ROLE<TAB>DIR" (see header for the verdicts).
@@ -110,7 +110,7 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
   [ ! -f "$tmp/share-sync-$f.log" ] || d="$d, last event $(ago $((now - $(mtime "$tmp/share-sync-$f.log")))) ago"
   printf "%s\t%s\t%s\t%s\n" "$v" "$d" "${role:-?}" "${dir:-?}"; }
 stop_friend() { local f="$1"; local p="" pf="$tmp/share-sync-$f.pid"
-  [ ! -f "$pf" ] || read -r p _ < "$pf"
+  [ ! -f "$pf" ] || read -r p _ < "$pf" || p=""
   [ -n "$p" ] || p="$(daemons_ps | awk -v f="$f" '$2==f{print $1; exit}')"
   [ -n "$p" ] || { echo "share sync: nothing running for $f" >&2; return 1; }
   kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
@@ -185,12 +185,13 @@ if [ -z "$fg" ]; then
   if [ -n "$opid" ]; then
     echo "share sync: already running for $f (pid $opid) — stop it first:  share sync stop --friend $f" >&2; exit 1
   fi
-  # own process group (setsid) so stop can kill the whole tree: loops, push/pull, croc
-  if command -v perl >/dev/null; then sid=(perl -MPOSIX -e 'setsid; exec @ARGV' --)
-  elif command -v python3 >/dev/null; then sid=(python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
-  else echo "share sync: no perl/python3 to daemonize — run with --fg yourself" >&2; exit 1; fi
-  nohup "${sid[@]}" "$0" --fg --friend "$f" --role "$role" --dir "$d" --every "$every" >> "$lg" 2>&1 &
+  # Bash job control gives this job its own process group, so stop still kills
+  # the whole tree. nohup ignores terminal hangups; redirect stdin as well as
+  # output so the daemon never reads from its launching terminal or pipeline.
+  set -m
+  nohup "$0" --fg --friend "$f" --role "$role" --dir "$d" --every "$every" </dev/null >> "$lg" 2>&1 &
   pid=$!
+  set +m
   printf '%s %s %s %s\n' "$pid" "$role" "$d" "$lg" > "$pidf"
   echo "share sync: $f (role $role) syncing $d in the background (pid $pid)"
   echo "share sync:   log:    share sync log --friend $f"
