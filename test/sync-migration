@@ -9,14 +9,18 @@ export SHARE_SECRET_MIGRATION="migration-$$" SHARE_AUTO_UPDATE=0 SHARE_FOLLOW_EV
 S() { "$1/share" sync "${@:2}"; }
 cleanup() { S "$repo" stop --friend migration >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-wait_for() { local attempt; for attempt in $(seq 1 60); do "$@" 2>/dev/null && return 0; [ "$attempt" != 60 ] || break; sleep 0.2; done; tail -n 20 "$W/t/share-sync-migration.log"; return 1; }
+wait_for() { local attempt; for attempt in $(seq 1 60); do "$@" 2>/dev/null && return 0; [ "$attempt" != 60 ] || break; sleep 0.2; done; echo "TIMEOUT: $*" >&2; tail -n 20 "$W/t/share-sync-migration.log"; return 1; }
 git_snapshot() { (cd "$W/d"; find .git -type f -exec openssl dgst -sha256 {} \; | LC_ALL=C sort); }
 echo before > "$W/d/note.txt"
+original_hash="$(openssl dgst -sha256 "$W/d/note.txt" | sed 's/.*= //')"
 S "$W/v1" --friend migration --role a --dir "$W/d" --every 1 >/dev/null
 wait_for git -C "$W/d" rev-parse --verify HEAD >/dev/null
 cleanup; sleep 1; git_snapshot > "$W/git.before"
 S "$repo" --friend migration --role a --dir "$W/d" --every 1 >/dev/null
-wait_for test -s "$W/d/.share/manifest"
+# A nonempty manifest can contain only .gitattributes while the first scan is
+# still seeding note.txt. Wait for its exact original bytes to be observed.
+seeded_note() { awk -F '\t' -v h="$original_hash" '$1=="note.txt"&&$5==h{found=1}END{exit !found}' "$W/d/.share/cache"; }
+wait_for seeded_note
 echo during-v2 > "$W/d/note.txt"
 wait_for grep -q $'M\tnote.txt' "$W/d/.share/history"
 cleanup; sleep 1; git_snapshot > "$W/git.after"; cmp "$W/git.before" "$W/git.after"
