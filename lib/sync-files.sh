@@ -5,19 +5,45 @@
 hash_file() { openssl dgst -sha256 "$1" | sed 's/.*= //'; }
 file_stat() { stat -c '%s %Y %i' "$1" 2>/dev/null || stat -f '%z %m %i' "$1" 2>/dev/null; }
 event() { printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$state/history"; }
+# Patterns are read once per scan/payload, not once per path: large ignored
+# trees made per-path rereads dominate every cycle.
+ignore_load() {
+  local pattern
+  ignores=(); ignores_from="$d"
+  [ -f "$d/.shareignore" ] || return 0
+  while IFS= read -r pattern || [ -n "$pattern" ]; do
+    case "$pattern" in ''|'#'*) continue;; esac
+    ignores+=("$pattern")
+  done < "$d/.shareignore"
+}
 ignored() {
   local p="$1" pattern
   case "/$p/" in */.share/*|*/.git/*) return 0;; esac
   [ "$p" != .shareignore ] || return 1
   case "${p##*/}" in .DS_Store|*.swp|*~|.~lock*|'~$'*|.syncthing.*|*.tmp-share-*) return 0;; esac
-  [ -f "$d/.shareignore" ] || return 1
-  while IFS= read -r pattern || [ -n "$pattern" ]; do
-    case "$pattern" in ''|'#'*) continue;; esac
+  [ "${ignores_from-}" = "$d" ] || ignore_load
+  for pattern in ${ignores[@]+"${ignores[@]}"}; do
     case "$p" in $pattern) return 0;; esac
     case "${p##*/}" in $pattern) return 0;; esac
     case "$pattern" in */) case "$p/" in "$pattern"*) return 0;; esac;; esac
-  done < "$d/.shareignore"
+  done
   return 1
+}
+# find arguments pruning directories whose every descendant ignored() skips.
+# find -path, like case, lets * match /, so a pattern ending in * that matches
+# a directory also matches everything below it; a literal x/ covers its tree.
+# Anything not pruned is still filtered per file, so semantics are unchanged.
+prune_args() {
+  local pattern root
+  root="$(printf '%s' "$d" | sed 's/[][*?\\]/\\&/g')"
+  prune=(-name .share -o -name .git)
+  for pattern in ${ignores[@]+"${ignores[@]}"}; do
+    case "$pattern" in
+      */) case "$pattern" in *[][*?\\]*) ;; *) prune+=(-o -path "$root/${pattern%/}");; esac;;
+      */\*) prune+=(-o -path "$root/${pattern%/\*}" -o -path "$root/$pattern");;
+      *\*) prune+=(-o -path "$root/$pattern");;
+    esac
+  done
 }
 safe_path() {
   local rest="$1" part at="$d"
@@ -82,8 +108,9 @@ local_version() {
   event "$rid" "$op" "$p"
 }
 scan() {
-  local file p st after old oldh h size mt inode
+  local file p st after old oldh h size mt inode prune
   : > "$state/seen"
+  ignore_load; prune_args
   while IFS= read -r -d '' file; do
     p="${file#"$d/"}"
     if ! safe_path "$p"; then
@@ -110,7 +137,7 @@ scan() {
     set_cache "$p" "$h" "$st"
     grep -Fxv -- "$p" "$state/rescan" > "$state/rescan.new" || true
     mv "$state/rescan.new" "$state/rescan"
-  done < <(find "$d" -type d \( -name .share -o -name .git \) -prune -o -type f -print0)
+  done < <(find "$d" -type d \( "${prune[@]}" \) -prune -o -type f -print0)
   cp "$state/cache" "$state/cache.before"
   while IFS=$'\t' read -r p size mt inode oldh; do
     [ -n "$p" ] || continue
@@ -203,6 +230,7 @@ materialize() {
       set_cache "$p" "$h" "$(file_stat "$dest")"
       op=M; [ "$oldh" != - ] || op=A; case "$p" in *.conflict-*) op=C;; esac
       event "$f" "$op" "$p"
+      [ "$p" != .shareignore ] || ignore_load
     fi
     observe_path "$p"
   done < "$state/view"

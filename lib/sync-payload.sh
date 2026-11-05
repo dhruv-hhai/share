@@ -6,7 +6,7 @@ make_payload() {
   rm -rf "$build"; mkdir -p "$build/blobs" "$build/base"
   printf '2\n' > "$build/version"; cp "$state/replica" "$build/replica"
   cp "$state/manifest" "$bd/snapshot" || return 1
-  : > "$build/manifest"
+  : > "$build/manifest"; ignore_load
   # A newly added ignore rule must also stop sending previously tracked paths.
   # Retain their local clocks; ignoring is not a replicated deletion.
   while IFS=$'\t' read -r p h parent vv; do
@@ -39,7 +39,7 @@ receive_payload() {
     {for(i=2;i<=3;i++)if($i!="-"&&(length($i)!=64||$i~/[^a-f0-9]/))exit 1
      n=split($4,a,",");if(!n)exit 1;last=""
      for(i=1;i<=n;i++){if(split(a[i],b,":")!=2||b[1]!~/^[a-f0-9]+$/||b[2]!~/^[0-9]+$/||length(b[2])>12||("x" b[1])<=("x" last))exit 1;last=b[1]}}' "$state/incoming.raw" || return 1
-  : > "$state/incoming"
+  : > "$state/incoming"; ignore_load
   while IFS=$'\t' read -r p h parent vv; do
     safe_path "$p" || return 1
     ignored "$p" && continue
