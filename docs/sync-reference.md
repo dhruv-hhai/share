@@ -43,8 +43,12 @@ Only current content, text merge bases and in-flight payloads are retained.
   `.DS_Store`, `*.swp`, `*~`, `.~lock*`, `~$*`, `.syncthing.*` and
   `*.tmp-share-*`. A synced `.shareignore` accepts one Bash glob per line
   (full relative path or basename); blank/comment lines are ignored and a
-  trailing `/` excludes a directory tree. Git ignore rules are not imported:
-  copy any desired v1 exclusions into `.shareignore` before upgrading.
+  trailing `/` excludes a directory tree at that root path. Unlike Git, `*`
+  also matches `/` and there is no `!` negation; exclude a directory name at
+  any depth with `name/*` plus `*/name/*`. Directories whose every path is
+  ignored are pruned from the scan, so large ignored trees cost nothing.
+  Git ignore rules are not imported: copy any desired v1 exclusions into
+  `.shareignore` before upgrading.
 - **Local edits are scanned before applying incoming state.** Each replacement
   checks the cached stat and content hash, then writes a same-directory temp
   file and renames it. A changed destination is deferred. External writers

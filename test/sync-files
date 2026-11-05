@@ -48,6 +48,20 @@ echo corrupt > "$w/payload/blobs/$(printf '%064d' 1)"
 tar -cf "$w/corrupt.tar" -C "$w/payload" version replica manifest blobs base
 if receive_payload "$w/corrupt.tar"; then echo 'corrupt blob accepted' >&2; exit 1; fi
 echo 'filesystem: missing and corrupt blobs refused'
+# Content members are unpacked in one pass; anything but a plain regular file
+# is refused unread, even a link whose target has the advertised hash.
+rm -f "$w/payload/blobs"/*; h1="$(hash_file "$w/a/hello.txt")"
+ln -s "$w/a/hello.txt" "$w/payload/blobs/$h1"
+printf 'link.txt\t%s\t-\tabcdef:1\n' "$h1" > "$w/payload/manifest"
+tar -cf "$w/link.tar" -C "$w/payload" version replica manifest blobs base
+if receive_payload "$w/link.tar"; then echo 'symlink member accepted' >&2; exit 1; fi
+! grep -q link.txt "$state/manifest"
+rm -f "$w/payload/blobs/$h1"; mkfifo "$w/payload/blobs/$h1"
+tar -cf "$w/fifo.tar" -C "$w/payload" version replica manifest blobs base
+if receive_payload "$w/fifo.tar"; then echo 'fifo member accepted' >&2; exit 1; fi
+! grep -q link.txt "$state/manifest"
+rm -f "$w/payload/blobs/$h1"
+echo 'filesystem: link and fifo members refused unread'
 d="$w/safety"; mkdir -p "$d/ignored"; init_state
 printf '*.secret\nignored/\n' > "$d/.shareignore"
 echo skip > "$d/token.secret"; echo skip > "$d/ignored/file"
@@ -66,3 +80,19 @@ tar -xOf "$bf" manifest > "$w/filtered"
 ! grep -q 'name with spaces.txt' "$w/filtered"
 grep -q '^.shareignore' "$w/filtered"
 echo 'filesystem: new ignores suppress previously tracked outgoing content'
+# Pruning ignored trees during the walk must sync exactly what per-path
+# filtering would, including a root whose name contains glob characters.
+d="$w/prune [x]*"; mkdir -p "$d"; init_state
+printf '%s\n' 'node_modules/*' '*/node_modules/*' 'build/' 'result-*' '*.log' 'docs/*/tmp*' > "$d/.shareignore"
+for p in node_modules/a/x sub/node_modules/b/y build/z build2/keep result-1/q sub/result-2/r \
+  keep/node_modules.txt keep/build/k keep/x.log.txt docs/a/tmp1/t docs/a/tmpfile docs/tmp/keep top.txt; do
+  mkdir -p "$(dirname "$d/$p")"; echo "$p" > "$d/$p"
+done
+scan
+(cd "$d" && find . -type f ! -path './.share/*' | sed 's|^\./||') | while IFS= read -r p; do
+  ignored "$p" || printf '%s\n' "$p"
+done | sort > "$w/expected"
+cut -f1 "$state/manifest" | sort > "$w/actual"
+diff "$w/expected" "$w/actual"
+grep -qx build2/keep "$w/actual"; grep -qx keep/build/k "$w/actual"; ! grep -q node_modules/ "$w/actual"
+echo 'filesystem: pruned walk matches per-path ignore filtering'
