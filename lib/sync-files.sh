@@ -107,6 +107,15 @@ local_version() {
   cat "$state/edit" >> "$state/observed.new"; mv "$state/observed.new" "$state/observed"
   event "$rid" "$op" "$p"
 }
+# Batch stat of newline-separated relative paths: "size mtime inode<TAB>./path"
+# (the ./ keeps a leading - from reading as an option).
+stat_paths() {
+  if stat -c %s / >/dev/null 2>&1; then
+    sed 's|^|./|' | tr '\n' '\0' | (cd "$d" && xargs -0 stat -c $'%s %Y %i\t%n' 2>/dev/null) || true
+  else
+    sed 's|^|./|' | tr '\n' '\0' | (cd "$d" && xargs -0 stat -f $'%z %m %i\t%N' 2>/dev/null) || true
+  fi
+}
 scan() {
   local file p st after old oldh h size mt inode prune
   : > "$state/seen"
@@ -120,6 +129,21 @@ scan() {
     fi
     ignored "$p" && continue
     printf '%s\n' "$p" >> "$state/seen"
+  done < <(find "$d" -type d \( "${prune[@]}" \) -prune -o -type f -print0)
+  # Unchanged files are settled by one batched stat joined with the cache, not
+  # several processes per file. The per-file checks below still decide the rest.
+  stat_paths < "$state/seen" > "$state/stats"
+  # "new" paths have no cache, manifest, observed or rescan rows at all.
+  awk -F '\t' -v now="$(date +%s)" '
+    FILENAME==ARGV[1]{cache[$1]=$2 " " $3 " " $4;next}
+    FILENAME==ARGV[2]{rescan[$1]=1;next}
+    FILENAME==ARGV[3]||FILENAME==ARGV[4]{known[$1]=1;next}
+    {sub(/^\.\//,"",$2);split($1,a," ");if(!($2 in cache)||cache[$2]!=$1||a[2]>=now-2||($2 in rescan))
+      print (($2 in cache)||($2 in rescan)||($2 in known)?"seen":"new") "\t" $2}' \
+    "$state/cache" "$state/rescan" "$state/manifest" "$state/observed" "$state/stats" > "$state/changed"
+  : > "$state/fresh"; : > "$state/fresh.cache"
+  while IFS=$'\t' read -r kind p; do
+    file="$d/$p"
     st="$(file_stat "$file")" || continue
     old="$(cache_row "$p")"; oldh="${old##* }"; oldh="${oldh:--}"
     read -r size mt inode <<< "$st"
@@ -130,19 +154,31 @@ scan() {
     h="$(hash_file "$state/snapshot")"; after="$(file_stat "$file")"
     [ "$st" = "$after" ] && [ "$h" = "$(hash_file "$file")" ] || continue
     mv "$state/snapshot" "$state/blobs/$h" || continue
-    if [ "$h" != "$oldh" ]; then
-      local_version "$p" "$h" "$oldh" || return 1
-      [ "$size" -lt $((${SHARE_BIG_MB:-20}*1048576)) ] || log "large file $((size/1048576))MB: $p"
+    [ "$size" -lt $((${SHARE_BIG_MB:-20}*1048576)) ] || [ "$h" = "$oldh" ] || log "large file $((size/1048576))MB: $p"
+    # A new path's first version is always "rid:1" with no parent. Register
+    # them in one merge below; a first scan otherwise rewrites the whole
+    # manifest once per file.
+    if [ "$kind" = new ]; then
+      printf '%s\t%s\t-\t%s:1\n' "$p" "$h" "$rid" >> "$state/fresh"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$p" $st "$h" >> "$state/fresh.cache"
+      continue
     fi
+    if [ "$h" != "$oldh" ]; then local_version "$p" "$h" "$oldh" || return 1; fi
     set_cache "$p" "$h" "$st"
     grep -Fxv -- "$p" "$state/rescan" > "$state/rescan.new" || true
     mv "$state/rescan.new" "$state/rescan"
-  done < <(find "$d" -type d \( "${prune[@]}" \) -prune -o -type f -print0)
-  cp "$state/cache" "$state/cache.before"
+  done < "$state/changed"
+  if [ -s "$state/fresh" ]; then
+    sync_merge "$state/manifest" "$state/fresh" > "$state/manifest.new" && mv "$state/manifest.new" "$state/manifest" || return 1
+    cat "$state/fresh" >> "$state/observed"; cat "$state/fresh.cache" >> "$state/cache"
+    awk -F '\t' -v t="$(date -u +%FT%TZ)" -v rid="$rid" '{print t "\t" rid "\tA\t" $1}' "$state/fresh" >> "$state/history"
+  fi
+  # Cached paths no longer seen: candidates for deletion.
+  awk -F '\t' 'FILENAME==ARGV[1]{seen[$0]=1;next}!($1 in seen)' "$state/seen" "$state/cache" > "$state/cache.before"
   while IFS=$'\t' read -r p size mt inode oldh; do
     [ -n "$p" ] || continue
     ignored "$p" && continue
-    if ! grep -Fxq -- "$p" "$state/seen" && [ ! -e "$d/$p" ] && [ ! -L "$d/$p" ]; then
+    if [ ! -e "$d/$p" ] && [ ! -L "$d/$p" ]; then
       local_version "$p" - "$oldh" && set_cache "$p" - '' || return 1
     fi
   done < "$state/cache.before"
@@ -173,7 +209,12 @@ make_view() {
 }
 text_merges() {
   local p h parent vv n joined elected first second
-  cut -f1 "$state/manifest" | LC_ALL=C sort -u > "$state/paths"
+  # Pre-filter with the loop's own pure sibling checks: exactly two versions
+  # with different hashes, no deletion, and one shared non-empty parent. Most
+  # two-sibling paths are identical-hash concurrent creations from a migration.
+  awk -F '\t' '{n[$1]++;if(n[$1]==1){h[$1]=$2;q[$1]=$3}else{h2[$1]=$2;q2[$1]=$3}}
+    END{for(p in n)if(n[p]==2&&h[p]!=h2[p]&&h[p]!="-"&&h2[p]!="-"&&q[p]==q2[p]&&q[p]!="-")print p}' \
+    "$state/manifest" | LC_ALL=C sort > "$state/paths"
   while IFS= read -r p; do
     is_text "$p" || continue
     path_entries "$p" > "$state/siblings"
@@ -206,8 +247,20 @@ materialize() {
     awk -F '\t' 'FILENAME==ARGV[1]{seen[$1]=1;next}!($1 in seen){print $1 "\t-"}' "$state/view" "$state/applied" > "$state/obsolete"
     cat "$state/obsolete" >> "$state/view"
   fi
-  while IFS=$'\t' read -r p h; do
+  # A path already materialized (view hash == cached hash) whose file keeps the
+  # cached, settled stat tuple only needs observing; scan trusts the same tuple.
+  # Mark those rows so the loop skips rehashing every file on every receive.
+  awk -F '\t' 'FILENAME==ARGV[1]{c[$1]=$5;next}($1 in c)&&c[$1]==$2{print $1}' "$state/cache" "$state/view" | stat_paths > "$state/same.stats"
+  awk -F '\t' -v now="$(date +%s)" '
+    FILENAME==ARGV[1]{cache[$1]=$2 " " $3 " " $4;next}
+    FILENAME==ARGV[2]{rescan[$1]=1;next}
+    FILENAME==ARGV[3]{sub(/^\.\//,"",$2);split($1,a," ");if(cache[$2]==$1&&a[2]<now-2&&!($2 in rescan))settled[$2]=1;next}
+    {print $1 "\t" $2 "\t" (($1 in settled)?"settled":"-")}' \
+    "$state/cache" "$state/rescan" "$state/same.stats" "$state/view" > "$state/view.flagged"
+  : > "$state/settled"
+  while IFS=$'\t' read -r p h flag; do
     safe_path "$p" && ! ignored "$p" || continue
+    if [ "$flag" = settled ]; then printf '%s\n' "$p" >> "$state/settled"; continue; fi
     dest="$d/$p"; old="$(cache_row "$p")"; oldh="${old##* }"; oldh="${oldh:--}"
     if [ -f "$dest" ]; then
       st="$(file_stat "$dest")"
@@ -233,29 +286,38 @@ materialize() {
       [ "$p" != .shareignore ] || ignore_load
     fi
     observe_path "$p"
-  done < "$state/view"
+  done < "$state/view.flagged"
+  # The manifest is fixed during the loop, so observing them together is the same.
+  if [ -s "$state/settled" ]; then
+    awk -F '\t' 'FILENAME==ARGV[1]{s[$0]=1;next}FILENAME==ARGV[2]{if(!($1 in s))print;next}($1 in s)' \
+      "$state/settled" "$state/observed" "$state/manifest" > "$state/observed.new" && mv "$state/observed.new" "$state/observed"
+  fi
   make_view > "$state/applied.new"; mv "$state/applied.new" "$state/applied"
   retain_blobs
 }
 retain_blobs() {
-  local p h parent vv file size
+  local p h parent vv size
   : > "$state/base.keep"
   while IFS=$'\t' read -r p h parent vv; do
     is_text "$p" || continue
     for h in "$h" "$parent"; do
       [ "$h" != - ] || continue
-      if [ -f "$state/blobs/$h" ]; then
+      # Content-addressed: an existing base copy already holds these bytes.
+      if [ ! -f "$state/base/$h" ] && [ -f "$state/blobs/$h" ]; then
         size="$(wc -c < "$state/blobs/$h")"
         if [ "$size" -le $((${SHARE_TEXT_MAX_KB:-1024}*1024)) ]; then cp "$state/blobs/$h" "$state/base/$h"; fi
       fi
       [ ! -f "$state/base/$h" ] || printf '%s\n' "$h" >> "$state/base.keep"
     done
   done < "$state/manifest"
-  for file in "$state/base"/*; do
-    [ ! -f "$file" ] || grep -Fxq "${file##*/}" "$state/base.keep" || rm -f "$file"
-  done
+  prune_store base base.keep
   { cut -f2 "$state/manifest"; cut -f5 "$state/cache"; } | LC_ALL=C sort -u > "$state/blob.keep"
-  for file in "$state/blobs"/*; do
-    [ ! -f "$file" ] || grep -Fxq "${file##*/}" "$state/blob.keep" || rm -f "$file"
-  done
+  prune_store blobs blob.keep
+}
+# Remove store files not listed in the keep file: one set difference, not a grep per file.
+prune_store() {
+  local file
+  (cd "$state/$1" && find . -type f -name '[!.]*' | sed 's|^\./||') | LC_ALL=C sort |
+    LC_ALL=C comm -23 - <(LC_ALL=C sort -u "$state/$2") |
+    while IFS= read -r file; do rm -f "$state/$1/$file"; done
 }
