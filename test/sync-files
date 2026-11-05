@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2154,SC2034
 # Exercise the actual filesystem engine without a transport or daemon.
+# Negative checks use if/exit: set -e ignores a failing `! cmd`.
 set -euo pipefail
 export LC_ALL=C
 sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
@@ -43,7 +44,7 @@ printf '2\n' > "$w/payload/version"; echo abcdef > "$w/payload/replica"
 printf 'missing.bin\t%064d\t-\tabcdef:1\n' 1 > "$w/payload/manifest"
 tar -cf "$w/missing.tar" -C "$w/payload" version replica manifest blobs base
 receive_payload "$w/missing.tar"
-! grep -q missing.bin "$state/manifest"
+if grep -q missing.bin "$state/manifest"; then echo 'assertion failed: grep -q missing.bin "$state/manifest"' >&2; exit 1; fi
 echo corrupt > "$w/payload/blobs/$(printf '%064d' 1)"
 tar -cf "$w/corrupt.tar" -C "$w/payload" version replica manifest blobs base
 if receive_payload "$w/corrupt.tar"; then echo 'corrupt blob accepted' >&2; exit 1; fi
@@ -55,11 +56,11 @@ ln -s "$w/a/hello.txt" "$w/payload/blobs/$h1"
 printf 'link.txt\t%s\t-\tabcdef:1\n' "$h1" > "$w/payload/manifest"
 tar -cf "$w/link.tar" -C "$w/payload" version replica manifest blobs base
 if receive_payload "$w/link.tar"; then echo 'symlink member accepted' >&2; exit 1; fi
-! grep -q link.txt "$state/manifest"
+if grep -q link.txt "$state/manifest"; then echo 'assertion failed: grep -q link.txt "$state/manifest"' >&2; exit 1; fi
 rm -f "$w/payload/blobs/$h1"; mkfifo "$w/payload/blobs/$h1"
 tar -cf "$w/fifo.tar" -C "$w/payload" version replica manifest blobs base
 if receive_payload "$w/fifo.tar"; then echo 'fifo member accepted' >&2; exit 1; fi
-! grep -q link.txt "$state/manifest"
+if grep -q link.txt "$state/manifest"; then echo 'assertion failed: grep -q link.txt "$state/manifest"' >&2; exit 1; fi
 rm -f "$w/payload/blobs/$h1"
 echo 'filesystem: link and fifo members refused unread'
 d="$w/safety"; mkdir -p "$d/ignored"; init_state
@@ -77,9 +78,18 @@ echo 'filesystem: ignores, spaces/backslashes, unsupported names and symlinks'
 printf 'name with spaces.txt\n' >> "$d/.shareignore"
 scan; make_payload
 tar -xOf "$bf" manifest > "$w/filtered"
-! grep -q 'name with spaces.txt' "$w/filtered"
+if grep -q 'name with spaces.txt' "$w/filtered"; then echo 'assertion failed: grep -q name with spaces.txt "$w/filtered"' >&2; exit 1; fi
 grep -q '^.shareignore' "$w/filtered"
 echo 'filesystem: new ignores suppress previously tracked outgoing content'
+# Extended attributes never become extra payload members (macOS tar would add
+# AppleDouble ._* entries, which a Linux peer refuses).
+if command -v xattr >/dev/null && xattr -w com.example.share-test 1 "$d/back\\slash.txt" 2>/dev/null; then
+  xattr -w com.example.share-test 1 "$state/replica"
+  scan; make_payload
+  # macOS tar -t hides the ._replica member it writes; look at the raw headers.
+  if LC_ALL=C grep -aq '\._replica' "$bf"; then echo 'assertion failed: LC_ALL=C grep -aq \._replica "$bf"' >&2; exit 1; fi
+  echo 'filesystem: xattrs add no payload members'
+fi
 # Pruning ignored trees during the walk must sync exactly what per-path
 # filtering would, including a root whose name contains glob characters.
 d="$w/prune [x]*"; mkdir -p "$d"; init_state
@@ -94,5 +104,6 @@ scan
 done | sort > "$w/expected"
 cut -f1 "$state/manifest" | sort > "$w/actual"
 diff "$w/expected" "$w/actual"
-grep -qx build2/keep "$w/actual"; grep -qx keep/build/k "$w/actual"; ! grep -q node_modules/ "$w/actual"
+grep -qx build2/keep "$w/actual"; grep -qx keep/build/k "$w/actual"
+if grep -q node_modules/ "$w/actual"; then echo "assertion failed: node_modules synced" >&2; exit 1; fi
 echo 'filesystem: pruned walk matches per-path ignore filtering'
