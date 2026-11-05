@@ -22,7 +22,9 @@ make_payload() {
     fi
     [ ! -f "$state/base/$parent" ] || cp "$state/base/$parent" "$build/base/$parent" || return 1
   done < "$build/sends"
-  tar -cf "$bf.new" -C "$build" version replica manifest blobs base && mv "$bf.new" "$bf"
+  # macOS tar stores extended attributes (e.g. com.apple.provenance, set on new
+  # files) as AppleDouble ._* members; a Linux peer refuses them as unknown.
+  COPYFILE_DISABLE=1 tar -cf "$bf.new" -C "$build" version replica manifest blobs base && mv "$bf.new" "$bf"
 }
 receive_payload() {
   local archive="$1" entry p h parent vv src x="$state/unpack"
