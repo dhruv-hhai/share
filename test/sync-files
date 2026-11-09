@@ -79,6 +79,17 @@ scan; scan
 grep -F 'back\slash.txt' "$state/manifest" >/dev/null
 [ "$(find "$state" -name 'skipped-*' | wc -l)" -eq 2 ]
 echo 'filesystem: ignores, spaces/backslashes, unsupported names and symlinks'
+# An incoming row whose local path is a symlink is skipped; the rest still applies.
+d="$w/us"; f=ur; mkdir -p "$d"; init_state
+echo tool > "$d/tool"; echo ok > "$d/ok.txt"; scan; retain_blobs
+bd="$w/us-out"; bf="$bd/share-sync-v2.tar"; mkdir -p "$bd"; make_payload
+d="$w/ur"; f=us; mkdir -p "$d"; init_state
+echo target > "$d/tool.mjs"; ln -s tool.mjs "$d/tool"
+receive_payload "$bf" 2> "$w/ur.err" || { cat "$w/ur.err" >&2; echo 'payload with a locally symlinked path refused' >&2; exit 1; }
+cmp "$w/us/ok.txt" "$d/ok.txt"
+[ -L "$d/tool" ] && [ "$(cat "$d/tool.mjs")" = target ]
+grep -q 'skipped incoming unsupported path: tool' "$w/ur.err"
+echo 'filesystem: incoming row on a local symlink skipped, other rows applied'
 printf 'name with spaces.txt\n' >> "$d/.shareignore"
 scan; make_payload
 tar -xOf "$bf" manifest > "$w/filtered"
