@@ -107,5 +107,17 @@ diff "$w/expected" "$w/actual"
 grep -qx build2/keep "$w/actual"; grep -qx keep/build/k "$w/actual"
 if grep -q node_modules/ "$w/actual"; then echo "assertion failed: node_modules synced" >&2; exit 1; fi
 echo 'filesystem: pruned walk matches per-path ignore filtering'
+# A lost local blob never blocks payloads: identical working bytes restore it,
+# otherwise that version is left out of the payload instead of failing it.
+d="$w/heal"; f=peer; mkdir -p "$d"; init_state
+echo keep > "$d/keep.txt"; echo gone > "$d/gone.txt"; scan
+hk="$(path_entries keep.txt | cut -f2)"; hg="$(path_entries gone.txt | cut -f2)"
+rm "$state/blobs/$hk" "$state/blobs/$hg"; echo changed > "$d/gone.txt"
+make_payload 2>/dev/null
+[ -f "$state/blobs/$hk" ] && [ "$(hash_file "$state/blobs/$hk")" = "$hk" ]
+tar -xOf "$bf" manifest > "$w/heal-manifest"
+grep -q "^keep.txt"$'\t'"$hk" "$w/heal-manifest"
+if grep -q "$hg" "$w/heal-manifest"; then echo 'unsendable version advertised' >&2; exit 1; fi
+echo 'filesystem: missing blobs healed from working files or left out of payloads'
 # Per-path .sharemerge strategies; run here so CI picks them up with this suite.
 "$BASH" "$(dirname "$0")/sync-strategies"
