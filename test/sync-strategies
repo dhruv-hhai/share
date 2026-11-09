@@ -2,7 +2,8 @@
 # shellcheck disable=SC2154,SC2034
 # Per-path merge strategies from .sharemerge, on hand-built concurrent siblings.
 # Negative checks use if/exit: set -e ignores a failing `! cmd`.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "$0: line $LINENO: $BASH_COMMAND (exit $?)" >&2' ERR
 export LC_ALL=C
 sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
 # shellcheck source=../lib/sync-state.sh
