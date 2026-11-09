@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Pure register algebra, including a seeded corpus; no transport or git.
 set -euo pipefail
+echo "probe: $(type -t mkdir) $(command -v mkdir) BASH_ENV=${BASH_ENV:-} $(uname -r)"; findmnt -T /tmp -o TARGET,FSTYPE,OPTIONS | tail -1; df -hT /tmp | tail -1
+pd="$(mktemp -d)"; mkdir "$pd/x"; if mkdir "$pd/x" 2>/dev/null; then echo "probe: second mkdir SUCCEEDED"; else echo "probe: second mkdir refused"; fi
+for i in $(seq 1 200); do ( mkdir "$pd/r$((i/2))" 2>/dev/null && echo win ) & done > "$pd/wins"; wait; echo "probe: $(wc -l < "$pd/wins") wins for 100 dirs (want 100)"
 for i in 1 2 3 4 5 6; do "$BASH" "$(dirname "$0")/sync-locks" > /tmp/lk 2>&1 || { cat /tmp/lk; exit 1; }; done; echo locks x6 ok
 for i in 1 2 3 4 5 6; do "$BASH" "$(dirname "$0")/sync-ledger" > /tmp/lg 2>&1 || { cat /tmp/lg; exit 1; }; done; echo ledger x6 ok
 sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
