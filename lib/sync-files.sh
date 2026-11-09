@@ -4,7 +4,8 @@
 # shellcheck disable=SC2154,SC2254,SC2034
 hash_file() { openssl dgst -sha256 "$1" | sed 's/.*= //'; }
 file_stat() { stat -c '%s %Y %i' "$1" 2>/dev/null || stat -f '%z %m %i' "$1" 2>/dev/null; }
-event() { printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$state/history"; }
+# Fifth column is the writer (rid/name); "-" name when no writer was declared.
+event() { printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" "${rid:-?}/${writer:--}" >> "$state/history"; }
 # Patterns are read once per scan/payload, not once per path: large ignored
 # trees made per-path rereads dominate every cycle.
 ignore_load() {
@@ -191,8 +192,88 @@ stat_paths() {
     sed 's|^|./|' | tr '\n' '\0' | (cd "$d" && xargs -0 stat -f $'%z %m %i\t%N' 2>/dev/null) || true
   fi
 }
+# Queued writer lines (tools/seen, tools/wrote; spec section 2). Drained first in
+# every scan so a wrote is versioned before the scanner looks at the file. A
+# queue is moved aside before reading, so lines appended meanwhile wait for the
+# next pass; a crash leaves NAME.q.work, which is drained before any new .q.
+# All seen lines go before any wrote line: a read is recorded before a write
+# queued alongside it, even when both fall in the same second.
+drain_writers() {
+  local f work name pass
+  mkdir -p "$state/writers" || return 1
+  for f in "$d/.share/writers"/*.q; do
+    [ -f "$f" ] || continue
+    [ ! -f "$f.work" ] || continue
+    mv "$f" "$f.work" || continue
+  done
+  for pass in s w; do
+    for work in "$d/.share/writers"/*.q.work; do
+      [ -f "$work" ] || continue
+      name="${work##*/}"; name="${name%.q.work}"
+      case "$name" in ''|*[!A-Za-z0-9_.-]*) continue;; esac
+      while IFS=$'\t' read -r _ op p st || [ -n "$op" ]; do
+        [ "$op" = "$pass" ] || continue
+        drain_line "$name" "$op" "$p" "$st" || return 1
+      done < "$work"
+    done
+  done
+  rm -f "$d/.share/writers"/*.q.work
+}
+# Writer base: the head a writer last saw, as "path<TAB>hash<TAB>vector".
+base_set() {
+  local bf="$state/writers/$1.base"
+  [ -f "$bf" ] || : > "$bf"
+  SHARE_QUERY_PATH="$2" awk -F '\t' '$1!=ENVIRON["SHARE_QUERY_PATH"]' "$bf" > "$bf.new" || return 1
+  printf '%s\t%s\t%s\n' "$2" "$3" "$4" >> "$bf.new"
+  mv "$bf.new" "$bf"
+}
+drain_line() {
+  local name="$1" op="$2" rel="$3" st="$4" row cur vv
+  safe_path "$rel" || return 0
+  ignored "$rel" && return 0
+  row="$(cache_row "$rel")"; cur="${row##* }"; cur="${cur:--}"
+  case "$op" in
+    s)
+      # A cache row whose stat tuple still matches says which content was read.
+      if [ -n "$row" ] && [ "${row% *}" = "$st" ]; then
+        vv="$(path_entries "$rel" | awk -F '\t' -v h="$cur" '$2==h{print $4;exit}')"
+        if [ -n "$vv" ]; then base_set "$name" "$rel" "$cur" "$vv" || return 1; fi
+      fi;;
+    w)
+      # Subshell: the writer name must not leak into the daemon's own events.
+      ( writer="$name"; wrote_version "$rel" "$cur" ) || return 1;;
+  esac
+}
+# A write by a writer. Runs in a subshell from drain_line, with $writer set.
+wrote_version() {
+  local rel="$1" cur="$2" h bh bvv brow vv
+  [ -f "$d/$rel" ] && [ ! -L "$d/$rel" ] || return 0
+  cp "$d/$rel" "$state/snapshot" || return 0
+  h="$(hash_file "$state/snapshot")"
+  [ "$h" != "$cur" ] || return 0
+  mv "$state/snapshot" "$state/blobs/$h" || return 0
+  brow="$(SHARE_QUERY_PATH="$rel" awk -F '\t' '$1==ENVIRON["SHARE_QUERY_PATH"]{print $2 " " $3;exit}' "$state/writers/$writer.base" 2>/dev/null || true)"
+  read -r bh bvv <<< "$brow" || true
+  if [ -z "$bh" ] || [ "$bh" = "$cur" ]; then
+    # Base is the head (or unknown): an ordinary successor, versioned now.
+    local_version "$rel" "$h" "$cur" || return 1
+  else
+    # The head moved after this writer read the file. Its bytes become a sibling
+    # of the head with parent = base. The vector is the base's plus rid~WRITER,
+    # so it is concurrent with the head and the head is not dropped.
+    vv="$(printf 'x\t-\t-\t%s\n' "$bvv" | sync_clock "$rid~$writer")"
+    printf '%s\t%s\t%s\t%s\n' "$rel" "$h" "$bh" "$vv" > "$state/edit"
+    sync_merge "$state/manifest" "$state/edit" > "$state/manifest.new" && mv "$state/manifest.new" "$state/manifest" || return 1
+    # Observed, so this writer's next edit dominates the sibling it resolves.
+    cat "$state/edit" >> "$state/observed"
+    event "$rid" M "$rel"
+  fi
+  set_cache "$rel" "$h" "$(file_stat "$d/$rel")" || return 1
+  base_set "$writer" "$rel" "$h" "$(cut -f4 "$state/edit")"
+}
 scan() {
   local file p st after old oldh h size mt inode prune
+  drain_writers || return 1
   : > "$state/seen"
   ignore_load; prune_args
   while IFS= read -r -d '' file; do
@@ -246,7 +327,7 @@ scan() {
   if [ -s "$state/fresh" ]; then
     sync_merge "$state/manifest" "$state/fresh" > "$state/manifest.new" && mv "$state/manifest.new" "$state/manifest" || return 1
     cat "$state/fresh" >> "$state/observed"; cat "$state/fresh.cache" >> "$state/cache"
-    awk -F '\t' -v t="$(date -u +%FT%TZ)" -v rid="$rid" '{print t "\t" rid "\tA\t" $1}' "$state/fresh" >> "$state/history"
+    awk -F '\t' -v t="$(date -u +%FT%TZ)" -v rid="$rid" -v w="${writer:--}" '{print t "\t" rid "\tA\t" $1 "\t" rid "/" w}' "$state/fresh" >> "$state/history"
   fi
   # Cached paths no longer seen: candidates for deletion.
   awk -F '\t' 'FILENAME==ARGV[1]{seen[$0]=1;next}!($1 in seen)' "$state/seen" "$state/cache" > "$state/cache.before"

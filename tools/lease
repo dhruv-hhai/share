@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# desc: advisory leases on path globs: claim, renew, release, check, list
+# usage: share lease claim   <glob>... --ttl 30m [--writer W] [--pid PID] [--dir D]
+#        share lease renew   [--writer W] [--dir D]
+#        share lease release [<glob>...] [--writer W] [--dir D]
+#        share lease check   <path>... [--writer W] [--dir D]     exit 0 free or own, 3 held
+#        share lease list    [--dir D]                           TSV: glob writer expires pid claim-id
+# Leases are ledger entries; .share/leases.idx is a projection that check and
+# list read directly, so a hook pays for one awk and no rebuild.
+# shellcheck disable=SC2254
+set -euo pipefail
+export LC_ALL=C
+tab="$(printf '\t')"; nl=$'\n'
+die() { echo "share lease: $*" >&2; exit 2; }
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in claim|renew|release|check|list) ;; *) die "usage: share lease claim|renew|release|check|list (see --help)";; esac
+ttl=""; pid="$PPID"; dir=""; name="${SHARE_WRITER:-}"; name="${name:--}"; args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ttl) ttl="${2:?--ttl needs a value}"; shift 2;;
+    --pid) pid="${2:?--pid needs a value}"; shift 2;;
+    --writer) name="${2:?--writer needs a value}"; shift 2;;
+    --dir) dir="${2:?--dir needs a value}"; shift 2;;
+    *) args+=("$1"); shift;;
+  esac
+done
+case "$pid" in ''|*[!0-9]*) die "bad pid: $pid";; esac
+case "$name" in ''|*[!A-Za-z0-9_.-]*) die "bad writer name: $name";; esac
+if [ -z "$dir" ]; then
+  dir="$PWD"
+  while [ ! -d "$dir/.share" ]; do [ "$dir" != / ] || die "no .share/ at or above $PWD (use --dir)"; dir="$(dirname "$dir")"; done
+fi
+state="$dir/.share"
+[ -s "$state/replica" ] || die "no replica ID in $state/replica"
+rid="$(cat "$state/replica")"
+writer="$rid/$name"
+now="$(date +%s)"
+
+# replaced by ledger_append from lib/sync-ledger.sh at integration
+# One Contracts-B line: id prev hlc writer kind subject data...; prints its id.
+lease_ledger_append() {
+  local writer_id="$1" kind="$2" subject="$3" rid_part name_part file prev last lh ls lc sec cnt hlc line id x
+  shift 3
+  rid_part="${writer_id%%/*}"; name_part="${writer_id#*/}"
+  file="$state/ledger/$rid_part/$name_part.log"
+  mkdir -p "$state/ledger/$rid_part"
+  prev=-; last=""
+  if [ -f "$file" ]; then last="$(tail -n 1 "$file")"; [ -z "$last" ] || prev="${last%%"$tab"*}"; fi
+  # hlc: unix seconds + per-writer counter; never moves backwards within a chain
+  sec="$now"; cnt=0
+  if [ -n "$last" ]; then
+    lh="$(printf '%s' "$last" | cut -f3)"; ls="$((10#${lh:0:10}))"; lc="$((10#${lh:10:6}))"
+    if [ "$ls" -ge "$now" ]; then sec="$ls"; cnt="$((lc + 1))"; fi
+  fi
+  hlc="$(printf '%010d%06d' "$sec" "$cnt")"
+  line="$prev$tab$hlc$tab$writer_id$tab$kind$tab$subject"
+  for x in "$@"; do line="$line$tab$x"; done
+  id="$(printf '%s' "$line" | openssl dgst -sha256 | sed 's/.*= //')"
+  printf '%s\n' "$id$tab$line" >> "$file"
+  printf '%s\n' "$id"
+}
+
+# Projection: latest claim/renew/release per (writer, glob) in hlc order.
+lease_rebuild() {
+  { cat "$state"/ledger/*/*.log 2>/dev/null || :; } | LC_ALL=C sort -u | LC_ALL=C sort -t "$tab" -k3,3 -k4,4 |
+    awk -F '\t' '
+      $5 == "lease-claim" { k = $4 SUBSEP $6; live[k] = 1; g[k] = $6; w[k] = $4; ex[k] = $7; pid[k] = $8; cid[k] = $1 }
+      $5 == "lease-renew" { k = $4 SUBSEP $6; if (k in live) ex[k] = $7 }
+      $5 == "lease-release" { delete live[$4 SUBSEP $6] }
+      END { for (k in live) { sub(/^glob:/, "", g[k]); printf "%s\t%s\t%s\t%s\t%s\n", g[k], w[k], ex[k], pid[k], cid[k] } }' |
+    LC_ALL=C sort > "$state/leases.idx.new"
+  mv "$state/leases.idx.new" "$state/leases.idx"
+}
+
+# Index rows that are unexpired; on our own replica the PID must also be alive.
+lease_rows() {
+  { awk -F '\t' -v now="$now" '$3 > now' "$state/leases.idx" 2>/dev/null || :; } | while IFS="$tab" read -r g w e p c; do
+    if [ "${w%%/*}" = "$rid" ] && ! kill -0 "$p" 2>/dev/null; then continue; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$g" "$w" "$e" "$p" "$c"
+  done
+}
+
+# hit SUBJECT HELD-GLOB MODE: path mode matches a path (or its basename) against
+# the held glob; glob mode checks overlap either way round, literal equality included.
+hit() {
+  if [ "$3" = path ]; then
+    case "$1" in $2) return 0;; esac
+    case "${1##*/}" in $2) return 0;; esac
+    return 1
+  fi
+  [ "$1" = "$2" ] && return 0
+  case "$1" in $2) return 0;; esac
+  case "$2" in $1) return 0;; esac
+  return 1
+}
+# Live rows of other writers that hit SUBJECT (uses $rows, set by the caller).
+holders() {
+  local s="$1" m="$2" g w e p c
+  while IFS="$tab" read -r g w e p c; do
+    [ -n "$g" ] && [ "$w" != "$writer" ] || continue
+    hit "$s" "$g" "$m" && printf '%s\t%s\t%s\t%s\t%s\n' "$g" "$w" "$e" "$p" "$c" || true
+  done <<EOF
+${rows:-}
+EOF
+}
+ttl_secs() {
+  local n="$1" m=1
+  case "$n" in *s) n="${n%s}";; *m) n="${n%m}"; m=60;; *h) n="${n%h}"; m=3600;; esac
+  case "$n" in ''|*[!0-9]*) return 1;; esac
+  [ "$((10#$n))" -gt 0 ] || return 1
+  echo "$((10#$n * m))"
+}
+ttl_of() { { cat "$state"/ledger/*/*.log 2>/dev/null || :; } | awk -F '\t' -v id="$1" '$1 == id {print $9; exit}'; }
+valid_glob() { case "$1" in ''|*"$tab"*|*"$nl"*) die "bad glob: $1";; esac; }
+
+cmd_claim() {
+  local g secs out expires rc=0
+  [ "${#args[@]}" -gt 0 ] || die "claim needs at least one glob"
+  [ -n "$ttl" ] || die "claim needs --ttl"
+  secs="$(ttl_secs "$ttl")" || die "bad --ttl: $ttl (use 90s, 30m, 2h or seconds)"
+  rows="$(lease_rows)"
+  for g in "${args[@]}"; do
+    valid_glob "$g"
+    out="$(holders "$g" glob)"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; rc=3; fi
+  done
+  [ "$rc" = 0 ] || exit 3
+  expires=$((now + secs))
+  for g in "${args[@]}"; do lease_ledger_append "$writer" lease-claim "glob:$g" "$expires" "$pid" "$secs" >/dev/null; done
+  lease_rebuild
+}
+
+cmd_renew() {
+  local g p c secs
+  # A live holder past its TTL is revived by renew, as long as its PID is alive.
+  { awk -F '\t' -v w="$writer" '$2 == w {print $1 "\t" $4 "\t" $5}' "$state/leases.idx" 2>/dev/null || :; } | while IFS="$tab" read -r g p c; do
+    kill -0 "$p" 2>/dev/null || continue
+    secs="$(ttl_of "$c")"; [ -n "$secs" ] || continue
+    lease_ledger_append "$writer" lease-renew "glob:$g" "$((now + secs))" >/dev/null
+  done
+  lease_rebuild
+}
+
+cmd_release() {
+  local g own list
+  own="$(awk -F '\t' -v w="$writer" '$2 == w {print $1}' "$state/leases.idx" 2>/dev/null || :)"
+  if [ "${#args[@]}" -gt 0 ]; then list="$(printf '%s\n' "${args[@]}")"; else list="$own"; fi
+  printf '%s\n' "$list" | while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    printf '%s\n' "$own" | grep -Fxq -- "$g" || continue
+    lease_ledger_append "$writer" lease-release "glob:$g" - >/dev/null
+  done
+  lease_rebuild
+}
+
+cmd_check() {
+  local p out rc=0
+  [ "${#args[@]}" -gt 0 ] || die "check needs at least one path"
+  rows="$(lease_rows)"
+  for p in "${args[@]}"; do
+    p="${p#"$dir"/}"
+    out="$(holders "$p" path)"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; rc=3; fi
+  done
+  exit "$rc"
+}
+
+case "$cmd" in
+  claim) cmd_claim;;
+  renew) cmd_renew;;
+  release) cmd_release;;
+  check) cmd_check;;
+  list) lease_rows;;
+esac

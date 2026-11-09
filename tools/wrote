@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# desc: record that a writer changed a file (versioned as its successor); one queued line, no hashing
+# usage: share wrote PATH [--writer NAME] [--dir DIR]
+# Appends "time wrote path stat" to .share/writers/NAME.q; the daemon drains it on its next scan.
+# Never starts the daemon, hashes or takes the sync lock (agent tool calls run this).
+set -euo pipefail
+op=w
+die() { echo "share: $*" >&2; exit 1; }
+path=""; writer="${SHARE_WRITER:--}"; dir=""
+while [ $# -gt 0 ]; do case "$1" in
+  --writer|-w) writer="${2:?}"; shift 2;;
+  --dir)       dir="${2:?}"; shift 2;;
+  -*)          echo "usage: share seen PATH [--writer NAME] [--dir DIR]" >&2; exit 2;;
+  *)           path="$1"; shift;;
+esac; done
+[ -n "$path" ] || { echo "usage: share seen PATH [--writer NAME] [--dir DIR]" >&2; exit 2; }
+case "$writer" in ''|*[!A-Za-z0-9_.-]*) die "bad writer name (use A-Za-z0-9_.-)";; esac
+# Physical paths, so the prefix strip matches the daemon's pwd -P root.
+if [ -n "$dir" ]; then
+  d="$(cd "$dir" 2>/dev/null && pwd -P)" || die "no such dir: $dir"
+  case "$path" in /*) abs="$path";; *) abs="$d/$path";; esac
+else
+  case "$path" in /*) abs="$path";; *) abs="$PWD/$path";; esac
+  d="$(cd "${abs%/*}" 2>/dev/null && pwd -P)" || die "no such directory for $path"
+  abs="$d/${abs##*/}"
+  # Nearest ancestor with a .share/ (the sync root), same walk as a dir lookup.
+  while [ ! -d "$d/.share" ]; do [ "$d" != / ] || die "no .share/ above $path"; d="${d%/*}"; [ -n "$d" ] || d=/; done
+fi
+[ -d "$d/.share" ] || die "no .share/ in $d"
+rel="${abs#"$d"}"; rel="${rel#/}"
+case "$rel" in ''|*$'\t'*|*$'\n'*) die "path not under $d: $path";; esac
+# Same stat tuple as lib file_stat (GNU first, then BSD); "-" when the file is gone.
+st="$(stat -c '%s %Y %i' "$abs" 2>/dev/null || stat -f '%z %m %i' "$abs" 2>/dev/null || echo -)"
+mkdir -p "$d/.share/writers"
+printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$op" "$rel" "$st" >> "$d/.share/writers/$writer.q"

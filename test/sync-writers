@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Writers: seen/wrote queues, a write from a stale base becomes a sibling, and
+# history names the writer. No daemon: scan and text_merges are called directly.
+# shellcheck disable=SC2154,SC2034
+set -euo pipefail
+export LC_ALL=C
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+sync_lib="$repo/lib"
+# shellcheck source=../lib/sync-state.sh
+. "$sync_lib/sync-state.sh"
+# shellcheck source=../lib/sync-files.sh
+. "$sync_lib/sync-files.sh"
+# shellcheck source=../lib/sync-payload.sh
+. "$sync_lib/sync-payload.sh"
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+log() { echo "$*" >&2; }
+fail() { echo "writers: $*" >&2; exit 1; }
+# A history line from writer $1 (name) exists.
+event_by() { awk -F '\t' -v k="$rid/$1" '$5==k{n++}END{exit !n}' "$state/history"; }
+d="$w/a"; f=peer; mkdir -p "$d"; init_state
+printf 'one\ntwo\nthree\n' > "$d/notes.txt"; scan; retain_blobs
+h0="$(path_entries notes.txt | cut -f2)"
+
+# seen: one line, four columns, found from a subdirectory by walking up.
+mkdir -p "$d/sub"
+(cd "$d/sub" && "$repo/tools/seen" --writer A ../notes.txt)
+"$repo/tools/seen" --dir "$d" --writer B notes.txt
+[ "$(wc -l < "$d/.share/writers/A.q")" -eq 1 ] || fail 'seen did not append one line'
+awk -F '\t' 'NF==4&&$2=="s"&&$3=="notes.txt"{ok=1}END{exit !ok}' "$d/.share/writers/A.q" || fail 'seen line format'
+if "$repo/tools/seen" --dir "$d" --writer 'a/b' notes.txt 2>/dev/null; then fail 'bad writer name accepted'; fi
+echo 'writers: seen queues one line, walks up to .share, rejects bad names'
+
+# A writes first: its base is the head, so the write is a plain successor of H0.
+printf 'ONE\ntwo\nthree\n' > "$d/notes.txt"
+"$repo/tools/wrote" --dir "$d" --writer A notes.txt
+scan; retain_blobs
+[ "$(path_entries notes.txt | wc -l)" -eq 1 ] || fail "A's write should supersede H0: $(path_entries notes.txt)"
+event_by A || fail 'no history line for writer A'
+[ ! -e "$d/.share/writers/A.q" ] && [ ! -e "$d/.share/writers/A.q.work" ] || fail 'A queue not drained'
+
+# B wrote from the content it read before A's edit: a sibling of H1 with parent H0.
+printf 'one\ntwo\nTHREE\n' > "$d/notes.txt"
+"$repo/tools/wrote" --dir "$d" --writer B notes.txt
+scan; retain_blobs
+[ "$(path_entries notes.txt | wc -l)" -eq 2 ] || fail "B's stale write should be a sibling: $(path_entries notes.txt)"
+[ "$(path_entries notes.txt | awk -F '\t' -v p="$h0" '$3==p' | wc -l | tr -d ' ')" -eq 2 ] || fail 'siblings do not share parent H0'
+event_by B || fail 'no history line for writer B'
+echo 'writers: stale-base write became a sibling with parent H0'
+
+# Siblings with a shared parent and diff3 merge to one version holding both edits.
+text_merges
+[ "$(path_entries notes.txt | wc -l)" -eq 1 ] || fail "siblings did not merge: $(path_entries notes.txt)"
+materialize
+grep -qx 'ONE' "$d/notes.txt" && grep -qx 'THREE' "$d/notes.txt" || fail "merge lost an edit: $(cat "$d/notes.txt")"
+echo 'writers: diff3 merges the two writers into one version with both edits'
+
+# Plain edits with no writer are attributed to rid/-.
+echo plain > "$d/plain.txt"; scan
+echo plain2 > "$d/plain.txt"; scan
+event_by - || fail 'plain scan edit not attributed to rid/-'
+awk -F '\t' 'NF!=5{exit 1}' "$state/history" || fail "history line without five columns: $(awk -F '\t' 'NF!=5' "$state/history" | head -1)"
+echo 'writers: plain edits attributed to rid/-, every history line has five columns'
+echo 'writers: passed'

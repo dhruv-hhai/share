@@ -157,19 +157,23 @@ case "$sub" in
     [ -n "$f" ] || { echo "usage: share sync history --friend NAME [N]" >&2; exit 1; }
     info "$f"; hd="${dir:-${SHARE_PULL_DIR:-$HOME/share}/$f}"
     [ -f "$hd/.share/history" ] || { echo "share sync: no sync history at $hd" >&2; exit 1; }
-    tail -n "$n" "$hd/.share/history" | awk -F '\t' '{t=substr($1,6,11);sub(/T/," ",t);printf "%s  %s  %s %s\n",t,$2,$3,$4}'
+    # Writer is the trailing column; lines written before writers existed have four.
+    tail -n "$n" "$hd/.share/history" | awk -F '\t' '{t=substr($1,6,11);sub(/T/," ",t);printf "%s  %s  %s %s",t,$2,$3,$4;if($5!="")printf "  %s",$5;print ""}'
     exit 0;;
 esac
 
-f=""; role=""; d=""; every=""; fg=""
+f=""; role=""; d=""; every=""; fg=""; writer="${SHARE_WRITER:--}"
 while [ $# -gt 0 ]; do case "$1" in
   --friend|-f) f="${2:?}"; shift 2;;
   --role|-r)   role="${2:?}"; shift 2;;
   --dir)       d="${2:?}"; shift 2;;
   --every)     every="${2:?}"; shift 2;;
+  --writer)    writer="${2:?}"; shift 2;;
   --fg)        fg=1; shift;;
   *) shift;;
 esac; done
+# Writer names become ledger/queue file names: same charset as .sharemerge strategies.
+case "$writer" in ''|*[!A-Za-z0-9_.-]*) echo "share sync: bad --writer name (use A-Za-z0-9_.-)" >&2; exit 1;; esac
 [ -n "$f" ] || { echo "usage: share sync --friend NAME --role a|b [--dir DIR] [--every SEC] [--fg]" >&2; exit 1; }
 # no --role: resume from the saved config (what `restart` and `check --repair` use)
 if [ -z "$role" ] && [ -f "$cfgd/$f" ]; then read -r srole severy sdir < "$cfgd/$f"; role="$srole"; d="${d:-$sdir}"; every="${every:-$severy}"; fi

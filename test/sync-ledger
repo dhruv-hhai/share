@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Ledger chains: ids, hlc shape, verify, prefix-or-fork accept, lease projection.
+# shellcheck disable=SC2154
+set -euo pipefail
+export LC_ALL=C
+sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
+# shellcheck source=../lib/sync-files.sh
+. "$sync_lib/sync-files.sh"
+# shellcheck source=../lib/sync-ledger.sh
+. "$sync_lib/sync-ledger.sh"
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+state="$w/share"; mkdir -p "$state"
+log() { echo "$*" >&2; }
+
+# Two writers: ids are real hashes, prev chains hold, hlc is fixed width and monotonic.
+a1="$(ledger_append r1/a version path:x.txt h1 - a:1 -)"
+a2="$(ledger_append r1/a version path:x.txt h2 "$a1" a:2 -)"
+b1="$(ledger_append r2/b version path:y.txt h3 - b:1 -)"
+a3="$(ledger_append r1/a version path:y.txt h4 - a:3 -)"
+f="$state/ledger/r1/a.log"
+[ "$(wc -l < "$f")" -eq 3 ]
+[ "$(cut -f1 "$f" | sed -n 1p)" = "$a1" ]
+[ "$(cut -f1 "$f" | sed -n 2p)" = "$a2" ]
+[ "$(cut -f1 "$f" | sed -n 3p)" = "$a3" ]
+[ "$(cut -f2 "$f" | sed -n 1p)" = - ]
+[ "$(cut -f2 "$f" | sed -n 2p)" = "$a1" ]
+[ "$(cut -f2 "$f" | sed -n 3p)" = "$a2" ]
+for g in "$f" "$state/ledger/r2/b.log"; do
+  awk -F '\t' '{ if (length($3) != 16) exit 1; if (NR > 1 && $3 <= p) exit 1; p = $3 }' "$g"
+done
+[ "$(ledger_hlc r1/a | wc -c | tr -d ' ')" -eq 17 ]
+ledger_verify > "$w/v"; [ ! -s "$w/v" ]
+ledger_lines > "$w/all"; [ "$(wc -l < "$w/all")" -eq 4 ]
+LC_ALL=C sort -c -t$'\t' -k3,3 -k4,4 "$w/all"
+[ "$(ledger_lines version | wc -l)" -eq 4 ]
+[ -z "$(ledger_lines nope)" ]
+if ledger_append r1/a version path:x 'a	b' 2>/dev/null; then echo "tab accepted" >&2; exit 1; fi
+if ledger_append 'r1/a/x' version - 2>/dev/null; then echo "bad writer accepted" >&2; exit 1; fi
+[ "$b1" != "$a1" ]
+
+# A tampered byte is a bad-id on that line.
+cp "$f" "$w/a.orig"
+sed 's/h2/h9/' "$f" > "$f.new"; mv "$f.new" "$f"
+if ledger_verify > "$w/v"; then echo "tampered ledger verified" >&2; exit 1; fi
+grep -q "^bad-id $f 2\$" "$w/v"
+cp "$w/a.orig" "$f"
+
+# A forged line with prev = a1 is a fork and breaks the prev chain.
+rest="$a1"$'\t'"9999999999000000"$'\t'"r1/a"$'\t'"version"$'\t'"path:x.txt"$'\t'"h7"$'\t'"-"$'\t'"a:7"$'\t'"-"
+forged="$(printf '%s' "$rest" | openssl dgst -sha256 | sed 's/.*= //')"
+printf '%s\t%s\n' "$forged" "$rest" >> "$f"
+if ledger_verify > "$w/v"; then echo "forged fork verified" >&2; exit 1; fi
+grep -q "^fork $f 4\$" "$w/v"
+grep -q "^bad-prev $f 4\$" "$w/v"
+if grep -q '^bad-id' "$w/v"; then echo "forged line has bad id" >&2; exit 1; fi
+cp "$w/a.orig" "$f"
+ledger_verify > "$w/v"; [ ! -s "$w/v" ]
+
+# Concurrent appenders on one writer: the lock keeps one chain, no forks.
+( for i in $(seq 1 20); do ledger_append r4/e note - "x$i" >/dev/null; done ) &
+( for i in $(seq 1 20); do ledger_append r4/e note - "y$i" >/dev/null; done ) &
+wait
+[ "$(wc -l < "$state/ledger/r4/e.log")" -eq 40 ]
+ledger_verify > "$w/v"; [ ! -s "$w/v" ]
+[ ! -d "$state/ledger/r4/e.lock" ]
+
+# Prefix extension replaces LOCAL; a stale peer keeps it; a divergent one is a fork file.
+local_f="$state/ledger/r3/c.log"
+ledger_append r3/c note - one >/dev/null
+ledger_append r3/c note - two >/dev/null
+cp "$local_f" "$w/local.orig"
+mkdir -p "$w/peer/ledger/r3"; cp "$local_f" "$w/peer/ledger/r3/c.log"
+( state="$w/peer"; ledger_append r3/c note - three >/dev/null )
+ledger_accept "$local_f" "$w/peer/ledger/r3/c.log"
+cmp "$local_f" "$w/peer/ledger/r3/c.log"
+[ "$(wc -l < "$local_f")" -eq 3 ]
+cp "$local_f" "$w/local.3"
+
+mkdir -p "$w/fork/ledger/r3"; head -n 1 "$local_f" > "$w/fork/ledger/r3/c.log"
+( state="$w/fork"; ledger_append r3/c note - alt >/dev/null )
+ledger_accept "$local_f" "$w/fork/ledger/r3/c.log"
+cmp "$local_f" "$w/local.3"
+h="$(hash_file "$w/fork/ledger/r3/c.log")"
+cmp "$state/ledger/r3/c.fork-${h:0:8}.log" "$w/fork/ledger/r3/c.log"
+ledger_accept "$local_f" "$w/local.orig"
+cmp "$local_f" "$w/local.3"
+ledger_accept "$state/ledger/r5/d.log" "$w/local.3"
+cmp "$state/ledger/r5/d.log" "$w/local.3"
+
+# Leases: claim, renew and release fold into one live lease per glob.
+cA="$(ledger_append r1/a lease-claim glob:src/* 1000 11 600)"
+ledger_append r1/a lease-renew glob:src/* 1500 >/dev/null
+cL="$(ledger_append r1/a lease-claim glob:lib/* 1000 11 600)"
+ledger_append r1/a lease-renew glob:lib/* 1500 >/dev/null
+cD="$(ledger_append r2/b lease-claim glob:docs/* 2000 22 600)"
+ledger_append r1/a lease-release glob:src/* - >/dev/null
+project_leases
+printf 'docs/*\tr2/b\t2000\t22\t%s\nlib/*\tr1/a\t1500\t11\t%s\n' "$cD" "$cL" > "$w/want"
+cmp "$state/leases.idx" "$w/want"
+[ ! -e "$state/leases.idx.new" ]
+[ -n "$cA" ]
+echo 'ledger: ids, chains, verify, concurrent append, accept and lease projection passed'

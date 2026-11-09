@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# desc: run a command while holding a named lock on this folder (same host)
+# usage: share lock <name> [--ttl 10m] [--wait 60s] [--dir D] [--writer W] -- <cmd>...
+#        acquires .share/locks/<name> (mkdir, pid + expires files), runs <cmd>, releases
+#        exit 3: --wait ran out; exit 2: bad arguments; otherwise the command's exit code
+#        a lock whose holder PID is gone, or whose --ttl has passed, is broken
+# Same mechanism as tools/sync lock(): mkdir is atomic, so only one holder at a time.
+# No flock on macOS. Cross-machine leases are a separate, later step.
+# Each lock and unlock is a ledger entry in .share/ledger/<replica>/<writer>.log.
+set -euo pipefail
+export LC_ALL=C
+die() { echo "share lock: $*" >&2; exit 2; }
+log() { echo "share lock: $*" >&2; }
+# GNU first: GNU `stat -f` prints a filesystem block before failing (same order as tools/sync).
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+# 30s | 5m | 1h | 45 (plain seconds); 10# keeps "010" decimal
+secs() {
+  local n u
+  n="${1%[smh]}"; u="${1:${#n}}"
+  case "$n" in ''|*[!0-9]*) die "bad duration '$1'";; esac
+  case "$u" in ''|s) echo $((10#$n));; m) echo $((10#$n*60));; h) echo $((10#$n*3600));; *) die "bad duration '$1'";; esac
+}
+
+case "${1:-}" in
+  -h|--help) sed -n '3,/^[^#]/{/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0;;
+  '') die "usage: share lock <name> [--ttl D] [--wait D] [--dir D] [--writer W] -- <cmd>...";;
+esac
+name="$1"; shift
+case "$name" in ''|*[!A-Za-z0-9_.-]*|.*) die "bad lock name '$name'";; esac
+
+ttl_s=600; wait_s=60; dir=""; writer="${SHARE_WRITER:--}"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+  [ $# -ge 2 ] || die "$1 needs a value"
+  case "$1" in
+    --ttl) ttl_s="$(secs "$2")";;
+    --wait) wait_s="$(secs "$2")";;
+    --dir) dir="$2";;
+    --writer) writer="$2";;
+    *) die "unknown option '$1'";;
+  esac
+  shift 2
+done
+[ "${1:-}" = -- ] || die "expected -- before the command"
+shift
+[ $# -gt 0 ] || die "no command after --"
+case "$writer" in ''|*[!A-Za-z0-9_.-]*|.*) die "bad writer '$writer'";; esac
+
+if [ -z "$dir" ]; then
+  dir="$PWD"
+  while [ ! -d "$dir/.share" ]; do [ "$dir" != / ] || die "no .share/ above $PWD (pass --dir)"; dir="$(dirname "$dir")"; done
+fi
+[ -d "$dir/.share" ] || die "no .share/ in $dir"
+rid="$(cat "$dir/.share/replica" 2>/dev/null || true)"
+[ -n "$rid" ] || die "no replica id in $dir/.share/replica"
+lk="$dir/.share/locks/$name"
+ledger_dir="$dir/.share/ledger/$rid"; ledger_file="$ledger_dir/$writer.log"; wfull="$rid/$writer"
+mkdir -p "$dir/.share/locks" "$ledger_dir"
+
+# replaced by ledger_append from lib/sync-ledger.sh at integration
+# Appends one TSV entry to this writer's chain: id prev hlc writer kind subject data...
+lock_ledger_append() {
+  local kind="$1" last prev sec cnt ls hlc line x id
+  shift
+  last="$(tail -n 1 "$ledger_file" 2>/dev/null || true)"
+  prev="$(printf '%s' "$last" | cut -f1)"; prev="${prev:--}"
+  sec="$(date +%s)"; cnt=0
+  if [ -n "$last" ]; then   # never go backwards within a second
+    ls="$(printf '%s' "$last" | cut -f3)"
+    if [ "$((10#${ls:0:10}))" -ge "$sec" ]; then sec=$((10#${ls:0:10})); cnt=$((10#${ls:10:6} + 1)); fi
+  fi
+  hlc="$(printf '%010d%06d' "$sec" "$cnt")"
+  line="$prev"$'\t'"$hlc"$'\t'"$wfull"$'\t'"$kind"$'\t'"lock:$name"
+  for x in "$@"; do line="$line"$'\t'"$x"; done
+  id="$(printf '%s' "$line" | openssl dgst -sha256 | sed 's/.*= //')"
+  printf '%s\t%s\n' "$id" "$line" >> "$ledger_file"
+}
+
+# why is set by stale(); a holder that has not written its pid yet is mid-acquire, so give it 5s
+why=""
+stale() {
+  local p e
+  p="$(cat "$lk/pid" 2>/dev/null || true)"; e="$(cat "$lk/expires" 2>/dev/null || echo 0)"
+  if [ -z "$p" ]; then
+    [ $(( $(date +%s) - $(mtime "$lk") )) -gt 5 ] || return 1
+    why="holder PID gone"; return 0
+  fi
+  if ! kill -0 "$p" 2>/dev/null; then why="holder PID gone"; return 0; fi
+  if [ "$(date +%s)" -ge "$e" ]; then why="expired"; return 0; fi
+  return 1
+}
+
+held=0; expires=0
+release() {
+  [ "$held" = 1 ] || return 0
+  held=0
+  lock_ledger_append unlock "$$" "$expires"
+  rm -f "$lk/pid" "$lk/expires"; rmdir "$lk" 2>/dev/null || true
+}
+trap 'rc=$?; release; exit "$rc"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+deadline=$(( $(date +%s) + wait_s ))
+until mkdir "$lk" 2>/dev/null; do
+  if stale; then
+    rm -f "$lk/pid" "$lk/expires"
+    rmdir "$lk" 2>/dev/null && log "broke stale lock $name ($why)"
+    continue
+  fi
+  [ "$(date +%s)" -lt "$deadline" ] || { log "gave up after ${wait_s}s waiting for lock $name"; exit 3; }
+  sleep 0.2
+done
+# expires before pid: a visible pid always comes with an expiry
+expires=$(( $(date +%s) + ttl_s ))
+echo "$expires" > "$lk/expires"
+echo "$$" > "$lk/pid"
+held=1
+lock_ledger_append lock "$$" "$expires"
+
+rc=0
+"$@" || rc=$?
+exit "$rc"
