@@ -2,7 +2,7 @@
 # Ledger chains: ids, hlc shape, verify, prefix-or-fork accept, lease projection.
 # shellcheck disable=SC2154
 set -Eeuo pipefail
-trap 'echo "$0: line $LINENO: $BASH_COMMAND (exit $?)" >&2' ERR
+trap 'echo "$0: line $LINENO callers ${BASH_LINENO[*]}: $BASH_COMMAND" >&2; cat "$w/v" >&2 2>/dev/null || true; ls -R "$state/ledger" >&2 2>/dev/null || true' ERR
 export LC_ALL=C
 sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
 # shellcheck source=../lib/sync-files.sh
