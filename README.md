@@ -88,7 +88,7 @@ the same result even if messages arrive twice or out of order.
 | What happens… | What share does |
 | --- | --- |
 | One machine goes offline | Keeps local edits and exchanges them when both sides are running again. |
-| Both edit the same file | Cleanly merges eligible text edits when possible; otherwise keeps an original plus `.conflict-…` copies on both sides. The same content hash wins on both machines. |
+| Both edit the same file | Cleanly merges eligible text edits when possible; otherwise keeps an original plus `.conflict-…` copies on both sides. The same content hash wins on both machines. A synced `.sharemerge` sets the strategy per path ([merge strategies](docs/sync-reference.md#versions-conflicts-and-storage)). |
 | One deletes while the other edits | Keeps the concurrent edit. An ordinary delete propagates to both sides. |
 | A transfer stalls or a machine wakes | Retries automatically. `waiting-peer` is normal when the other side is offline. |
 | A file changes during receive | Checks it before replacement and defers a changed file. A final save/rename race is still possible; keep backups. |
