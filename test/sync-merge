@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Pure register algebra, including a seeded corpus; no transport or git.
 set -euo pipefail
+for i in 1 2 3 4 5 6; do "$BASH" "$(dirname "$0")/sync-locks" > /tmp/lk 2>&1 || { cat /tmp/lk; exit 1; }; done; echo locks x6 ok
+for i in 1 2 3 4 5 6; do "$BASH" "$(dirname "$0")/sync-ledger" > /tmp/lg 2>&1 || { cat /tmp/lg; exit 1; }; done; echo ledger x6 ok
 sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
 # shellcheck source=../lib/sync-state.sh
 . "$sync_lib/sync-state.sh"

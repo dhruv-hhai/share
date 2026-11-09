@@ -11,11 +11,11 @@ mkdir -p "$w/.share"; echo r1 > "$w/.share/replica"
 echo "share lock (same host)"
 
 # 1. two contenders on one name never interleave
-"$lock" x --dir "$w" -- sh -c 'echo start >> "$1"; sleep 1; echo end >> "$1"' sh "$w/log" & a=$!
-"$lock" x --dir "$w" -- sh -c 'echo start >> "$1"; sleep 1; echo end >> "$1"' sh "$w/log" & b=$!
+bash -x "$lock" x --dir "$w" -- sh -c 'echo start >> "$1"; sleep 1; echo end >> "$1"' sh "$w/log" 2>"$w/xa" & a=$!
+bash -x "$lock" x --dir "$w" -- sh -c 'echo start >> "$1"; sleep 1; echo end >> "$1"' sh "$w/log" 2>"$w/xb" & b=$!
 wait "$a"; ra=$?; wait "$b"; rb=$?
 [ "$ra$rb" = 00 ] || fail "contenders exited $ra $rb"
-[ "$(paste -sd' ' "$w/log")" = "start end start end" ] || fail "interleaved: $(paste -sd' ' "$w/log")"
+[ "$(paste -sd' ' "$w/log")" = "start end start end" ] || { echo "== A pid $a"; grep -v -E 'secs|case|shift|\[ ' "$w/xa"; echo "== B pid $b"; grep -v -E 'secs|case|shift|\[ ' "$w/xb"; fail "interleaved: $(paste -sd' ' "$w/log")"; }
 [ ! -e "$w/.share/locks/x" ] || fail "lock dir left behind"
 pass "concurrent holders never interleave, lock released"
 
