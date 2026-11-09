@@ -8,12 +8,30 @@ heal_blob() {
   [ -f "$d/$1" ] && cp "$d/$1" "$t" 2>/dev/null && [ "$(hash_file "$t")" = "$2" ] && mv "$t" "$state/blobs/$2" && return 0
   rm -f "$t"; return 1
 }
+# Feature words this build implements; later phases append. A peer's critical
+# feature missing here refuses its payload; other unknown features are logged.
+share_features=()
+has_feature() {
+  local ft
+  for ft in ${share_features[@]+"${share_features[@]}"}; do [ "$ft" = "$1" ] && return 0; done
+  return 1
+}
+# Probed once at load. A failed probe leaves the flag empty, so the plain tar
+# call still runs. --no-xattrs drops the LIBARCHIVE.xattr headers that GNU tar
+# warns about; --warning silences only that keyword (BSD tar has no --warning).
+tar_no_xattrs=
+if tar --no-xattrs -cf /dev/null -T /dev/null 2>/dev/null; then tar_no_xattrs=--no-xattrs; fi
+# Read probe uses a piped empty archive: GNU tar rejects /dev/null as input.
+tar_quiet=
+if tar -cf - -T /dev/null 2>/dev/null | tar --warning=no-unknown-keyword -tf - 2>/dev/null; then tar_quiet=--warning=no-unknown-keyword; fi
 make_payload() {
-  local build="$bd/build" h p parent vv known
+  local build="$bd/build" h p parent vv known ft
   rm -rf "$build"; mkdir -p "$build/blobs" "$build/base"
   printf '2\n' > "$build/version"; cp "$state/replica" "$build/replica"
   cp "$state/manifest" "$bd/snapshot" || return 1
   : > "$build/manifest"; ignore_load
+  : > "$build/features"
+  for ft in ${share_features[@]+"${share_features[@]}"}; do printf '%s\n' "$ft" >> "$build/features"; done
   # A newly added ignore rule must also stop sending previously tracked paths.
   # Retain their local clocks; ignoring is not a replicated deletion.
   while IFS=$'\t' read -r p h parent vv; do
@@ -40,30 +58,45 @@ make_payload() {
   fi
   # macOS tar stores extended attributes (e.g. com.apple.provenance, set on new
   # files) as AppleDouble ._* members; a Linux peer refuses them as unknown.
-  COPYFILE_DISABLE=1 tar -cf "$bf.new" -C "$build" version replica manifest blobs base && mv "$bf.new" "$bf"
+  # COPYFILE_DISABLE covers the ._* members; --no-xattrs covers the xattr headers.
+  COPYFILE_DISABLE=1 tar ${tar_no_xattrs:+"$tar_no_xattrs"} -cf "$bf.new" -C "$build" version replica manifest features blobs base && mv "$bf.new" "$bf"
 }
 receive_payload() {
-  local archive="$1" entry p h parent vv src x="$state/unpack"
+  local archive="$1" entry p h parent vv src w x="$state/unpack"
   # Member names are validated first; content members are then unpacked in one
   # pass into a private directory (one read per member re-scanned the whole
   # archive each time). Only plain regular files are read: links, FIFOs and
   # devices are refused before any read. Hashes are validated, then renamed.
-  tar -tf "$archive" > "$state/members" || return 1
+  tar ${tar_quiet:+"$tar_quiet"} -tf "$archive" > "$state/members" || return 1
+  # Unknown members are skipped, never unpacked: a newer peer may send them.
   while IFS= read -r entry; do
-    case "$entry" in version|replica|manifest|blobs/|base/) ;;
+    case "$entry" in version|replica|manifest|features|critical|ledger/*|blobs/|base/) ;;
       blobs/*|base/*) h="${entry#*/}"; [ "${#h}" = 64 ] || return 1; case "$h" in *[!0-9a-f]*) return 1;; esac;;
-      *) return 1;;
+      *) log "skipping unknown payload member: $entry";;
     esac
   done < "$state/members"
-  [ "$(tar -xOf "$archive" version)" = 2 ] || return 1
-  tar -xOf "$archive" manifest > "$state/incoming.raw" || return 1
+  [ "$(tar ${tar_quiet:+"$tar_quiet"} -xOf "$archive" version)" = 2 ] || return 1
+  # Features are read before any content is unpacked, so a refused payload
+  # leaves no trace. Only plain files are read, as with content members.
+  for p in features critical; do
+    grep -qx "$p" "$state/members" || continue
+    [ "$(tar ${tar_quiet:+"$tar_quiet"} -tvf "$archive" "$p" | cut -c1)" = - ] || return 1
+    tar ${tar_quiet:+"$tar_quiet"} -xOf "$archive" "$p" > "$state/$p.raw" || return 1
+    while IFS= read -r w || [ -n "$w" ]; do
+      case "$w" in ''|'#'*) continue;; esac
+      has_feature "$w" && continue
+      if [ "$p" = critical ]; then log "peer requires feature $w; upgrade share"; return 1; fi
+      log "skipping unknown feature $w"
+    done < "$state/$p.raw"
+  done
+  tar ${tar_quiet:+"$tar_quiet"} -xOf "$archive" manifest > "$state/incoming.raw" || return 1
   awk -F '\t' 'NF!=4{exit 1}
     {for(i=2;i<=3;i++)if($i!="-"&&(length($i)!=64||$i~/[^a-f0-9]/))exit 1
      n=split($4,a,",");if(!n)exit 1;last=""
-     for(i=1;i<=n;i++){if(split(a[i],b,":")!=2||b[1]!~/^[a-f0-9]+$/||b[2]!~/^[0-9]+$/||length(b[2])>12||("x" b[1])<=("x" last))exit 1;last=b[1]}}' "$state/incoming.raw" || return 1
+     for(i=1;i<=n;i++){if(split(a[i],b,":")!=2||b[1]!~/^[a-f0-9]+(~[A-Za-z0-9_.-]+)?$/||b[2]!~/^[0-9]+$/||length(b[2])>12||("x" b[1])<=("x" last))exit 1;last=b[1]}}' "$state/incoming.raw" || return 1
   : > "$state/incoming"; ignore_load
   rm -rf "$x"; mkdir "$x" || return 1
-  tar -xf "$archive" -C "$x" blobs base || return 1
+  tar ${tar_quiet:+"$tar_quiet"} -xf "$archive" -C "$x" blobs base || return 1
   while IFS=$'\t' read -r p h parent vv; do
     safe_path "$p" || return 1
     ignored "$p" && continue

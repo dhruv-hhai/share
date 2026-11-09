@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# same-host lock tool: mutual exclusion, stale breaking, --wait timeout, exit codes, ledger chain.
+# usage: test/sync-locks        (~5s)
+set -uo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"; lock="$repo/tools/lock"
+pass() { echo "  ok  $*"; }
+fail() { echo "FAIL  $*" >&2; exit 1; }
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+mkdir -p "$w/.share"; echo r1 > "$w/.share/replica"
+
+echo "share lock (same host)"
+
+# 1. two contenders on one name never interleave
+"$lock" x --dir "$w" -- sh -c 'echo start >> "$1"; sleep 1; echo end >> "$1"' sh "$w/log" & a=$!
+"$lock" x --dir "$w" -- sh -c 'echo start >> "$1"; sleep 1; echo end >> "$1"' sh "$w/log" & b=$!
+wait "$a"; ra=$?; wait "$b"; rb=$?
+[ "$ra$rb" = 00 ] || fail "contenders exited $ra $rb"
+[ "$(paste -sd' ' "$w/log")" = "start end start end" ] || fail "interleaved: $(paste -sd' ' "$w/log")"
+[ ! -e "$w/.share/locks/x" ] || fail "lock dir left behind"
+pass "concurrent holders never interleave, lock released"
+
+# 2. a lock whose holder PID is dead is broken
+sh -c 'exit 0' & dead=$!; wait "$dead"
+mkdir -p "$w/.share/locks/s"; echo "$dead" > "$w/.share/locks/s/pid"; echo $(( $(date +%s) + 600 )) > "$w/.share/locks/s/expires"
+"$lock" s --dir "$w" --wait 5 -- true 2> "$w/err"; rc=$?
+[ "$rc" = 0 ] || fail "stale dead-PID lock not broken (exit $rc): $(cat "$w/err")"
+grep -q 'broke stale lock s (holder PID gone)' "$w/err" || fail "no break log: $(cat "$w/err")"
+pass "stale lock with dead holder is broken"
+
+# 2b. a lock past its expiry is broken even while the holder lives
+mkdir -p "$w/.share/locks/e"; echo "$$" > "$w/.share/locks/e/pid"; echo $(( $(date +%s) - 1 )) > "$w/.share/locks/e/expires"
+"$lock" e --dir "$w" --wait 5 -- true 2> "$w/err"; rc=$?
+[ "$rc" = 0 ] && grep -q 'broke stale lock e (expired)' "$w/err" || fail "expired lock not broken (exit $rc): $(cat "$w/err")"
+pass "expired lock with live holder is broken"
+
+# 3. a live holder with --wait 1 gives up with exit 3
+"$lock" h --dir "$w" -- sleep 3 & holder=$!
+i=0; until [ -f "$w/.share/locks/h/pid" ] || [ "$i" -ge 50 ]; do sleep 0.1; i=$((i+1)); done
+"$lock" h --dir "$w" --wait 1 -- true; rc=$?
+wait "$holder"
+[ "$rc" = 3 ] || fail "--wait against a live holder exited $rc, want 3"
+pass "--wait timeout exits 3"
+
+# 4. the command's exit code propagates and the lock is released
+"$lock" f --dir "$w" -- false; rc=$?
+[ "$rc" = 1 ] || fail "false exited $rc, want 1"
+[ ! -e "$w/.share/locks/f" ] || fail "lock not released after failing command"
+pass "command exit code propagates"
+
+# 5. ledger gets lock then unlock, chained, 7+ columns
+"$lock" led --dir "$w" --writer tester -- true || fail "ledger run failed"
+f="$w/.share/ledger/r1/tester.log"
+awk -F '\t' '
+  NR==1 { if ($5 != "lock" || $4 != "r1/tester" || $6 != "lock:led" || NF < 7 || $2 != "-") bad=1; a=$1 }
+  NR==2 { if ($5 != "unlock" || NF < 7 || $2 != a) bad=1 }
+  END   { exit (NR == 2 && !bad) ? 0 : 1 }' "$f" || fail "ledger lines wrong: $(cat "$f")"
+pass "ledger records lock then unlock with a hash chain"
+
+# 6. bad names are refused
+"$lock" '../x' --dir "$w" -- true 2>/dev/null; rc=$?
+[ "$rc" = 2 ] || fail "lock name '../x' accepted (exit $rc)"
+pass "lock names with path parts are refused"
+
+echo "all lock checks passed"

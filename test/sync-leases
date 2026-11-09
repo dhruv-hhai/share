@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Lease CLI over a scratch replica: claim, overlap refusal, liveness, TTL and renew.
+set -euo pipefail
+export LC_ALL=C
+tool="$(cd "$(dirname "$0")/.." && pwd)/tools/lease"
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+d="$w/r"; mkdir -p "$d/.share"; printf 'abcdef\n' > "$d/.share/replica"
+lz() { "$tool" "$@" --dir "$d"; }
+held=3
+
+lz claim 'src/*.md' --ttl 30m --writer A --pid $$
+[ "$(lz list | cut -f1,2)" = "$(printf 'src/*.md\tabcdef/A')" ]
+head -1 "$d/.share/ledger/abcdef/A.log" | cut -f2 | grep -qx -- '-'
+rc=0; lz check 'src/x.md' --writer B > "$w/out" || rc=$?
+[ "$rc" = "$held" ]; grep -q "abcdef/A" "$w/out"
+lz check 'src/x.md' --writer A
+rc=0; lz claim 'src/*.md' --ttl 30m --writer B --pid $$ || rc=$?
+[ "$rc" = "$held" ]
+rc=0; lz claim 'src/*' --ttl 30m --writer B --pid $$ || rc=$?
+[ "$rc" = "$held" ]
+echo 'leases: claim, check and overlap refusal passed'
+
+lz release --writer A
+lz claim 'src/*.md' --ttl 30m --writer B --pid $$
+lz release 'src/*.md' --writer B
+lz claim 'src/*.md' --ttl 30m --writer B --pid $$
+lz release --writer B
+echo 'leases: release frees the glob for another writer'
+
+sleep 0.1 & dead=$!; wait "$dead"
+lz claim 'dead/*.txt' --ttl 30m --writer C --pid "$dead"
+lz check 'dead/a.txt' --writer B
+echo 'leases: dead PID on our replica is free'
+
+lz claim 'ren/*' --ttl 10s --writer D --pid $$
+e1="$(lz list | awk -F '\t' '$2 == "abcdef/D" {print $3}')"
+sleep 1; lz renew --writer D
+e2="$(lz list | awk -F '\t' '$2 == "abcdef/D" {print $3}')"
+[ "$e2" -gt "$e1" ]
+echo 'leases: renew extends expiry'
+
+lz claim 'exp/*' --ttl 1s --writer E --pid $$
+sleep 2
+lz check 'exp/x' --writer B
+echo 'leases: expired TTL is free'
+
+lz claim 'keep/*' --ttl 1s --writer F --pid $$
+sleep 2
+lz renew --writer F
+rc=0; lz check 'keep/x' --writer B > /dev/null || rc=$?
+[ "$rc" = "$held" ]
+echo 'leases: renew revives a live holder past its TTL'
+
+TIMEFORMAT=%R
+t="$( { time (for _ in $(seq 1 20); do lz check 'src/x.md' --writer B >/dev/null || true; done); } 2>&1 )"
+awk -v t="$t" 'BEGIN{printf "leases: check averages %.1f ms over 20 runs (informational)\n", t*1000/20}'
+echo 'leases: claim, check, release, renew and expiry passed'

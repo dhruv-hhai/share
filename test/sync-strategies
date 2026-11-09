@@ -61,7 +61,7 @@ if command -v jq >/dev/null; then
 fi
 [ "$(versions src/app.ts)" = 2 ] || fail 'lease merged'
 [ "$(wc -l < "$state/collisions" | tr -d ' ')" = 1 ] || fail "collisions: $(cat "$state/collisions")"
-grep -q $'\tL\tsrc/app.ts$' "$state/history" || fail 'no lease event'
+grep -q $'\tL\tsrc/app.ts\t' "$state/history" || fail 'no lease event'
 echo 'strategies: lease records one collision and never merges'
 [ "$(versions notes.md)" = 2 ] || fail 'conflict-copies merged'
 [ "$(versions plain.txt)" = 1 ] && [ "$(content plain.txt)" = $'one\n2\nthree' ] || fail 'default diff3'

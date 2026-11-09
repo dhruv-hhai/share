@@ -13,6 +13,10 @@ sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
 . "$sync_lib/sync-payload.sh"
 w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
 log() { echo "$*" >&2; }
+# Receive PAYLOAD into a fresh state, in a subshell; tar's stderr goes to $w/recv.err.
+receive_quiet() {
+  ( d="$(mktemp -d "$w/recv.XXXXXX")"; f=peer; init_state && receive_payload "$1" ) 2>"$w/recv.err"
+}
 d="$w/a"; f=b; mkdir -p "$d"; init_state
 echo original > "$d/hello.txt"; scan; retain_blobs
 test "$(wc -l < "$state/manifest")" -eq 1
@@ -88,7 +92,10 @@ if command -v xattr >/dev/null && xattr -w com.example.share-test 1 "$d/back\\sl
   scan; make_payload
   # macOS tar -t hides the ._replica member it writes; look at the raw headers.
   if LC_ALL=C grep -aq '\._replica' "$bf"; then echo 'assertion failed: LC_ALL=C grep -aq \._replica "$bf"' >&2; exit 1; fi
-  echo 'filesystem: xattrs add no payload members'
+  # Extraction must stay quiet about xattr headers too (GNU tar warns on them).
+  receive_quiet "$bf" || { echo 'xattr payload not received' >&2; exit 1; }
+  if grep -q 'unknown extended header' "$w/recv.err"; then echo 'assertion failed: unknown extended header on stderr' >&2; exit 1; fi
+  echo 'filesystem: xattrs add no payload members or extraction warnings'
 fi
 # Pruning ignored trees during the walk must sync exactly what per-path
 # filtering would, including a root whose name contains glob characters.
@@ -119,5 +126,40 @@ tar -xOf "$bf" manifest > "$w/heal-manifest"
 grep -q "^keep.txt"$'\t'"$hk" "$w/heal-manifest"
 if grep -q "$hg" "$w/heal-manifest"; then echo 'unsendable version advertised' >&2; exit 1; fi
 echo 'filesystem: missing blobs healed from working files or left out of payloads'
+# Lenient receive: an unknown member is skipped and never unpacked, while a
+# critical feature this build lacks refuses the whole payload before any change.
+d="$w/lenient"; f=peer; mkdir -p "$d"; init_state
+lp="$w/lenient-payload"; rm -rf "$lp"; mkdir -p "$lp/blobs" "$lp/base" "$lp/extra"
+printf '2\n' > "$lp/version"; echo abcdef > "$lp/replica"; : > "$lp/features"
+echo lenient > "$w/lenient-src"; lh="$(hash_file "$w/lenient-src")"; cp "$w/lenient-src" "$lp/blobs/$lh"
+printf 'lenient.txt\t%s\t-\tabcdef:1\n' "$lh" > "$lp/manifest"
+echo junk > "$lp/extra/junk"
+tar -cf "$w/lenient.tar" -C "$lp" version replica manifest features blobs base extra
+receive_payload "$w/lenient.tar"
+grep -qx lenient "$d/lenient.txt"
+echo 'filesystem: unknown payload member skipped and known content applied'
+cp "$state/manifest" "$w/critical-before"
+printf 'refused.txt\t%s\t-\tabcdef:2\n' "$lh" > "$lp/manifest"
+printf 'nope\n' > "$lp/critical"
+tar -cf "$w/critical.tar" -C "$lp" version replica manifest features critical blobs base extra
+if receive_payload "$w/critical.tar"; then echo 'critical feature accepted' >&2; exit 1; fi
+cmp -s "$w/critical-before" "$state/manifest"
+[ ! -e "$d/refused.txt" ]
+echo 'filesystem: critical feature this build lacks refuses the payload'
+# Every payload carries a features member, empty while no feature is advertised.
+d="$w/features"; f=peer; mkdir -p "$d"; init_state
+echo feature > "$d/feature.txt"; scan
+bd="$w/feature-out"; bf="$bd/share-sync-v2.tar"; mkdir -p "$bd"; make_payload
+tar -tf "$bf" | grep -qx features
+echo 'filesystem: payloads advertise a features member'
+# Linux peers must receive without the xattr-header warning. This guards the
+# quiet-flag plumbing; GNU tar has no LIBARCHIVE headers, so it passes trivially.
+d="$w/quiet"; f=a; mkdir -p "$d"; init_state
+echo quiet > "$d/quiet.txt"; scan; make_payload
+receive_quiet "$bf" || { echo 'quiet payload not received' >&2; exit 1; }
+if grep -q 'Ignoring unknown extended header' "$w/recv.err"; then echo 'assertion failed: Ignoring unknown extended header on stderr' >&2; exit 1; fi
+echo 'filesystem: payload receive prints no tar extended-header warnings'
 # Per-path .sharemerge strategies; run here so CI picks them up with this suite.
 "$BASH" "$(dirname "$0")/sync-strategies"
+# Ledger, writers, leases and locks suites; run here so CI covers them with this suite.
+for t in sync-ledger sync-writers sync-leases sync-locks; do "$BASH" "$(dirname "$0")/$t"; done

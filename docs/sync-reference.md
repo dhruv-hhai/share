@@ -83,6 +83,12 @@ Only current content, text merge bases and in-flight payloads are retained.
   requires 2× the incoming tar size plus the configured reserve before reading
   its contents. Peer manifests omit already-known blobs as an optimization;
   missing blobs are retried on the next state exchange.
+- **Lenient payloads:** receive skips unknown members and unknown non-critical
+  `features` with a log line, and never unpacks them. A `critical` feature this
+  build lacks refuses the whole payload before any state changes.
+- **Features:** every payload carries a `features` member (one word per line,
+  empty until a build advertises one). Envelope `version` stays `2`; new
+  members start only once both peers advertise them.
 
 `status` reports pending entries, paths with causal siblings, and tombstones.
 Siblings can remain after deterministic conflict materialization until an
