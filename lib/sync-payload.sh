@@ -98,7 +98,13 @@ receive_payload() {
   rm -rf "$x"; mkdir "$x" || return 1
   tar ${tar_quiet:+"$tar_quiet"} -xf "$archive" -C "$x" blobs base || return 1
   while IFS=$'\t' read -r p h parent vv; do
-    safe_path "$p" || return 1
+    # A row this replica cannot write (e.g. its path is a local symlink) is skipped,
+    # not fatal: refusing the payload would stall every other path with it.
+    if ! safe_path "$p"; then
+      w="$(printf %s "$p" | openssl dgst -sha256 | sed 's/.*= //')"
+      if [ ! -f "$state/skipped-$w" ]; then log "skipped incoming unsupported path: $(printf %q "$p")"; : > "$state/skipped-$w"; fi
+      continue
+    fi
     ignored "$p" && continue
     for entry in "blobs/$h" "base/$parent"; do
       [ "${entry#*/}" != - ] || continue
