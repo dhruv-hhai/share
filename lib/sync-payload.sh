@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # The peer manifest is only a bandwidth hint. Missing bytes never enter state.
 # shellcheck disable=SC2154,SC2034
+# heal_blob PATH HASH: restore a missing blob from the working file if it still
+# has exactly those bytes.
+heal_blob() {
+  local t="$state/blobs/.heal-$$"
+  [ -f "$d/$1" ] && cp "$d/$1" "$t" 2>/dev/null && [ "$(hash_file "$t")" = "$2" ] && mv "$t" "$state/blobs/$2" && return 0
+  rm -f "$t"; return 1
+}
 make_payload() {
   local build="$bd/build" h p parent vv known
   rm -rf "$build"; mkdir -p "$build/blobs" "$build/base"
@@ -14,14 +21,23 @@ make_payload() {
     printf '%s\t%s\t%s\t%s\n' "$p" "$h" "$parent" "$vv" >> "$build/manifest"
   done < "$state/manifest"
   { cut -f2 "$state/peer/$f.manifest" 2>/dev/null || true; } | LC_ALL=C sort -u > "$state/peer.hashes"
-  awk -F '\t' 'FILENAME==ARGV[1]{k[$0]=1;next}{print $2 "\t" $3 "\t" (($2 in k)?"known":"-")}' \
+  awk -F '\t' 'FILENAME==ARGV[1]{k[$0]=1;next}{print $1 "\t" $2 "\t" $3 "\t" (($2 in k)?"known":"-")}' \
     "$state/peer.hashes" "$build/manifest" > "$build/sends"
-  while IFS=$'\t' read -r h parent known; do
+  : > "$build/unsendable"
+  while IFS=$'\t' read -r p h parent known; do
     if [ "$h" != - ] && [ "$known" != known ]; then
+      # A lost local blob must not stop every later payload: restore it from an
+      # identical working file, else leave that version out until rescanned.
+      [ -f "$state/blobs/$h" ] || heal_blob "$p" "$h" ||
+        { printf '%s\n' "$h" >> "$build/unsendable"; log "missing blob for $p; not sent until rescanned"; continue; }
       cp "$state/blobs/$h" "$build/blobs/$h" || return 1
     fi
     [ ! -f "$state/base/$parent" ] || cp "$state/base/$parent" "$build/base/$parent" || return 1
   done < "$build/sends"
+  if [ -s "$build/unsendable" ]; then
+    awk -F '\t' 'FILENAME==ARGV[1]{u[$0]=1;next}!($2 in u)' "$build/unsendable" "$build/manifest" > "$build/manifest.new" &&
+      mv "$build/manifest.new" "$build/manifest" || return 1
+  fi
   # macOS tar stores extended attributes (e.g. com.apple.provenance, set on new
   # files) as AppleDouble ._* members; a Linux peer refuses them as unknown.
   COPYFILE_DISABLE=1 tar -cf "$bf.new" -C "$build" version replica manifest blobs base && mv "$bf.new" "$bf"
