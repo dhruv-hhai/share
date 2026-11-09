@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154,SC2034
+# Per-path merge strategies from .sharemerge, on hand-built concurrent siblings.
+# Negative checks use if/exit: set -e ignores a failing `! cmd`.
+set -euo pipefail
+export LC_ALL=C
+sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
+# shellcheck source=../lib/sync-state.sh
+. "$sync_lib/sync-state.sh"
+# shellcheck source=../lib/sync-files.sh
+. "$sync_lib/sync-files.sh"
+w="$(mktemp -d)"; trap 'rm -rf "$w"' EXIT
+log() { echo "$*" >> "$w/log"; }
+export XDG_CONFIG_HOME="$w/cfg"
+d="$w/d"; f=peer; mkdir -p "$d"; init_state
+echo aaaaaa > "$state/replica"; rid=aaaaaa   # lowest ID: this replica is elected
+put() { printf '%b' "$1" > "$state/snapshot"; h="$(hash_file "$state/snapshot")"; mv "$state/snapshot" "$state/blobs/$h"; echo "$h"; }
+# siblings PATH BASE FIRST SECOND: two concurrent edits of one retained parent.
+siblings() {
+  local b x y
+  b="$(put "$2")"; cp "$state/blobs/$b" "$state/base/$b"; x="$(put "$3")"; y="$(put "$4")"
+  printf '%s\t%s\t%s\taaaaaa:2\n%s\t%s\t%s\taaaaaa:1,bbbbbb:1\n' "$1" "$x" "$b" "$1" "$y" "$b" > "$w/edit"
+  sync_merge "$state/manifest" "$w/edit" > "$state/manifest.new"; mv "$state/manifest.new" "$state/manifest"
+}
+versions() { path_entries "$1" | wc -l | tr -d ' '; }
+content() { cat "$state/blobs/$(path_entries "$1" | cut -f2)"; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+cat > "$d/.sharemerge" <<'EOF'
+# glob strategy; first match wins
+*.jsonl     union-lines
+*.json      json-merge   # key-level three-way
+src/*       lease
+notes.md    conflict-copies
+*.csv       cmd:sort-both
+*.tsv       cmd:missing
+*.yaml      bogus
+EOF
+mkdir -p "$XDG_CONFIG_HOME/share/merge"
+printf '#!/bin/sh\n# base first second path\nsort "$2" "$3"\n' > "$XDG_CONFIG_HOME/share/merge/sort-both"
+chmod +x "$XDG_CONFIG_HOME/share/merge/sort-both"
+
+siblings log.jsonl 'a\n' 'a\nb\nboth\n' 'a\nc\nboth\n'
+siblings conf.json '{"a":1,"n":{"x":1},"gone":1}' '{"a":2,"n":{"x":1}}' '{"a":1,"n":{"x":1,"y":2},"gone":1,"c":3}'
+siblings clash.json '{"a":1}' '{"a":2}' '{"a":3}'
+siblings src/app.ts 'one\n' 'two\n' 'three\n'
+siblings notes.md '1\n2\n3\n' 'one\n2\n3\n' '1\n2\nthree\n'
+siblings plain.txt '1\n2\n3\n' 'one\n2\n3\n' '1\n2\nthree\n'
+siblings data.csv 'x\n' 'first\n' 'second\n'
+siblings data.tsv 'x\n' 'first\n' 'second\n'
+siblings conf.yaml '1\n2\n3\n' 'one\n2\n3\n' '1\n2\nthree\n'
+siblings blob.bin '1\n2\n3\n' 'one\n2\n3\n' '1\n2\nthree\n'
+text_merges; text_merges
+
+[ "$(versions log.jsonl)" = 1 ] && [ "$(content log.jsonl)" = $'a\nb\nboth\nc' ] || fail "union-lines: $(content log.jsonl)"
+echo 'strategies: union-lines keeps both sides additions once'
+if command -v jq >/dev/null; then
+  [ "$(versions conf.json)" = 1 ] || fail json-merge
+  [ "$(content conf.json | jq -cS .)" = '{"a":2,"c":3,"n":{"x":1,"y":2}}' ] || fail "json-merge: $(content conf.json)"
+  [ "$(versions clash.json)" = 2 ] || fail 'json conflict merged'
+  echo 'strategies: json-merge merges keys and leaves real conflicts as copies'
+fi
+[ "$(versions src/app.ts)" = 2 ] || fail 'lease merged'
+[ "$(wc -l < "$state/collisions" | tr -d ' ')" = 1 ] || fail "collisions: $(cat "$state/collisions")"
+grep -q $'\tL\tsrc/app.ts$' "$state/history" || fail 'no lease event'
+echo 'strategies: lease records one collision and never merges'
+[ "$(versions notes.md)" = 2 ] || fail 'conflict-copies merged'
+[ "$(versions plain.txt)" = 1 ] && [ "$(content plain.txt)" = $'one\n2\nthree' ] || fail 'default diff3'
+[ "$(versions blob.bin)" = 2 ] || fail 'unmatched binary merged'
+echo 'strategies: conflict-copies override, unmatched text diff3, unmatched binary copies'
+[ "$(versions data.csv)" = 1 ] && [ "$(content data.csv)" = $'first\nsecond' ] || fail 'cmd driver'
+[ "$(versions data.tsv)" = 2 ] || fail 'missing driver merged'
+[ "$(versions conf.yaml)" = 2 ] || fail 'bad strategy merged'
+[ "$(grep -c 'bad strategy' "$w/log")" = 1 ] || fail "bad strategy warnings: $(cat "$w/log")"
+echo 'strategies: local cmd drivers; missing drivers and bad strategies keep copies'
+# Bases are retained for every merging strategy, not only *.md/*.txt.
+retain_blobs
+p="$(path_entries data.tsv | head -1 | cut -f3)"; [ -f "$state/base/$p" ] || fail 'cmd base dropped'
+p="$(path_entries blob.bin | head -1 | cut -f3)"
+if [ -f "$state/base/$p" ]; then fail 'binary base retained'; fi
+echo 'strategies: bases retained per strategy'
+# Only the elected replica merges.
+d="$w/e"; mkdir -p "$d"; init_state; echo zzzzzz > "$state/replica"; rid=zzzzzz
+cp "$w/d/.sharemerge" "$d/"; siblings log.jsonl 'a\n' 'a\nb\n' 'a\nc\n'; text_merges
+[ "$(versions log.jsonl)" = 2 ] || fail 'non-elected replica merged'
+echo 'strategies: only the elected replica merges'

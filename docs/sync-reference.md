@@ -37,6 +37,31 @@ Only current content, text merge bases and in-flight payloads are retained.
 - **Text merging:** `.md`, `.txt` and `SHARE_TEXT_EXT` extensions may merge with
   `diff3` when exactly two versions have a shared retained parent. The lowest
   replica ID performs a clean merge; overlapping edits keep conflict copies.
+- **Merge strategies:** a synced `.sharemerge` picks the strategy per path, one
+  `<glob> <strategy>` per line (globs as in `.shareignore`, first match wins,
+  `#` comments). Unmatched paths keep the defaults above.
+
+  ```
+  *.jsonl      union-lines      # append-only logs
+  *.json       json-merge
+  src/*        lease
+  *.lock       cmd:lockfile     # ~/.config/share/merge/lockfile
+  ```
+
+  | Strategy | Two concurrent edits of one parent become |
+  | --- | --- |
+  | `diff3` | a clean line merge, else conflict copies (default for text) |
+  | `union-lines` | one side, plus lines the other side added that it did not also add; the other side's deletions are not applied |
+  | `json-merge` | a key-level three-way merge of one JSON value per file (needs `jq`; output is reformatted); a key changed differently on both sides keeps conflict copies |
+  | `conflict-copies` | conflict copies, never merged (default for non-text) |
+  | `lease` | conflict copies plus one record per sibling set in `.share/collisions` (`time path hashes`) and an `L` history event, for whatever enforces leases |
+  | `cmd:NAME` | the stdout of the local executable `${XDG_CONFIG_HOME:-~/.config}/share/merge/NAME BASE FIRST SECOND PATH`; nonzero exit keeps conflict copies |
+
+  Only the elected replica runs a strategy and its result is an ordinary new
+  version, so both sides converge on it even if their drivers differ. Drivers
+  are never synced: a peer's `.sharemerge` can name one but not supply it.
+  Unknown strategies are logged once and keep conflict copies. Merge bases are
+  retained (up to `SHARE_TEXT_MAX_KB`) for every path whose strategy merges.
 - **Deletes propagate**, but concurrent edits win over deletion. Tombstones
   remain so an old payload cannot resurrect a causally deleted file.
 - **Ignores:** `.share/` and `.git/` are always excluded. Defaults also exclude

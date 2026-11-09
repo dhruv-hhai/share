@@ -107,3 +107,5 @@ diff "$w/expected" "$w/actual"
 grep -qx build2/keep "$w/actual"; grep -qx keep/build/k "$w/actual"
 if grep -q node_modules/ "$w/actual"; then echo "assertion failed: node_modules synced" >&2; exit 1; fi
 echo 'filesystem: pruned walk matches per-path ignore filtering'
+# Per-path .sharemerge strategies; run here so CI picks them up with this suite.
+"$BASH" "$(dirname "$0")/sync-strategies"

@@ -61,6 +61,81 @@ is_text() {
   for ext in ${SHARE_TEXT_EXT:-}; do case "$1" in *."${ext#.}") return 0;; esac; done
   return 1
 }
+# .sharemerge: "<glob> <strategy>" per line, first match wins, globs as in
+# .shareignore. Synced, so the elected replica (see text_merges) applies the
+# same rule either side wrote. Unmatched text keeps diff3, the rest copies.
+merge_load() {
+  local pattern strategy rest
+  merges=()
+  [ -f "$d/.sharemerge" ] || return 0
+  while read -r pattern strategy rest || [ -n "$pattern" ]; do
+    case "$pattern" in ''|'#'*) continue;; esac
+    case "$strategy" in
+      diff3|union-lines|json-merge|conflict-copies|lease) ;;
+      cmd:*) case "${strategy#cmd:}" in ''|*[!A-Za-z0-9_.-]*|.*) strategy=invalid;; esac;;
+      *) strategy=invalid;;
+    esac
+    if [ "$strategy" = invalid ]; then
+      grep -Fxq -- "$pattern" "$state/merge.warned" 2>/dev/null ||
+        { log ".sharemerge: bad strategy for $pattern; keeping conflict copies"; printf '%s\n' "$pattern" >> "$state/merge.warned"; }
+      strategy=conflict-copies
+    fi
+    merges+=("$pattern" "$strategy")
+  done < "$d/.sharemerge"
+}
+# Sets $strategy for path $1 (no subshell: retain_blobs asks once per entry).
+merge_strategy() {
+  local p="$1" i=0
+  while [ "$i" -lt "${#merges[@]}" ]; do
+    case "$p" in ${merges[i]}) strategy="${merges[i+1]}"; return;; esac
+    case "${p##*/}" in ${merges[i]}) strategy="${merges[i+1]}"; return;; esac
+    i=$((i+2))
+  done
+  if is_text "$p"; then strategy=diff3; else strategy=conflict-copies; fi
+}
+merge_uses_base() { case "$1" in diff3|union-lines|json-merge|cmd:*) return 0;; esac; return 1; }
+# merge_run STRATEGY PATH FIRST BASE SECOND > merged; nonzero leaves the
+# siblings as conflict copies. Drivers are local (never synced): a peer can
+# name one in .sharemerge but cannot supply the program.
+merge_run() {
+  local driver
+  case "$1" in
+    diff3) command -v diff3 >/dev/null && diff3 -m "$3" "$4" "$5";;
+    # Keep FIRST; append lines SECOND added over BASE that FIRST did not also add.
+    union-lines) awk 'FILENAME==ARGV[1]{b[$0]++;next}
+      FILENAME==ARGV[2]{print;f[$0]++;next}
+      !init{for(l in f)a[l]=f[l]-b[l];init=1}
+      {if(b[$0]>0)b[$0]--;else if(a[$0]>0)a[$0]--;else print}' "$4" "$3" "$5";;
+    json-merge) command -v jq >/dev/null && jq -n --slurpfile b "$4" --slurpfile x "$3" --slurpfile y "$5" '
+      # Values wrapped as [] (absent) or [v]; objects merge per key, anything
+      # else changed differently on both sides is a conflict.
+      def m($b; $x; $y):
+        if $x == $y then $x elif $x == $b then $y elif $y == $b then $x
+        elif ([$b, $x, $y] | all(length == 1 and (.[0] | type) == "object")) then
+          $b[0] as $bo | $x[0] as $xo | $y[0] as $yo |
+          [reduce ((($xo | keys_unsorted) + (($yo | keys_unsorted) - ($xo | keys_unsorted)))[]) as $k ({};
+            m(if $bo | has($k) then [$bo[$k]] else [] end;
+              if $xo | has($k) then [$xo[$k]] else [] end;
+              if $yo | has($k) then [$yo[$k]] else [] end) as $r |
+            if $r == [] then . else .[$k] = $r[0] end)]
+        else error("conflict") end;
+      if [$b, $x, $y | length] != [1, 1, 1] then error("one JSON value per file") else m($b; $x; $y)[0] end';;
+    cmd:*) driver="${XDG_CONFIG_HOME:-$HOME/.config}/share/merge/${1#cmd:}"
+      [ -x "$driver" ] && "$driver" "$4" "$3" "$5" "$2";;
+    *) return 1;;
+  esac
+}
+# A lease path with concurrent versions means two writers broke a territory:
+# record it once per sibling set for whoever enforces leases.
+lease_collision() {
+  local p="$1" hashes
+  hashes="$(cut -f2 "$state/siblings" | LC_ALL=C sort -u | paste -sd, -)"
+  SHARE_QUERY_PATH="$p" SHARE_QUERY_HASHES="$hashes" \
+    awk -F '\t' '$2==ENVIRON["SHARE_QUERY_PATH"]&&$3==ENVIRON["SHARE_QUERY_HASHES"]{found=1}END{exit !found}' \
+    "$state/collisions" 2>/dev/null && return 0
+  printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$p" "$hashes" >> "$state/collisions"
+  event "$rid" L "$p"; log "lease collision: $p"
+}
 init_state() {
   state="$d/.share"; [ ! -L "$state" ] || return 1
   mkdir -p "$state"/{blobs,base,peer} || return 1
@@ -208,16 +283,18 @@ make_view() {
     END{flush()}' "$state/manifest" "$state/sorted" | LC_ALL=C sort -u
 }
 text_merges() {
-  local p h parent vv n joined elected first second
-  # Pre-filter with the loop's own pure sibling checks: exactly two versions
-  # with different hashes, no deletion, and one shared non-empty parent. Most
-  # two-sibling paths are identical-hash concurrent creations from a migration.
-  awk -F '\t' '{n[$1]++;if(n[$1]==1){h[$1]=$2;q[$1]=$3}else{h2[$1]=$2;q2[$1]=$3}}
-    END{for(p in n)if(n[p]==2&&h[p]!=h2[p]&&h[p]!="-"&&h2[p]!="-"&&q[p]==q2[p]&&q[p]!="-")print p}' \
+  local p h parent vv n joined elected first second strategy
+  merge_load
+  # Only paths with at least two different versions. Most sibling paths are
+  # identical-hash concurrent creations from a migration.
+  awk -F '\t' '!(($1 SUBSEP $2) in seen){seen[$1,$2]=1;n[$1]++}END{for(p in n)if(n[p]>1)print p}' \
     "$state/manifest" | LC_ALL=C sort > "$state/paths"
   while IFS= read -r p; do
-    is_text "$p" || continue
+    merge_strategy "$p"
+    case "$strategy" in conflict-copies) continue;; esac
     path_entries "$p" > "$state/siblings"
+    if [ "$strategy" = lease ]; then lease_collision "$p"; continue; fi
+    # Merge only two edits of one shared non-empty parent, neither a deletion.
     n="$(wc -l < "$state/siblings" | tr -d ' ')"; [ "$n" = 2 ] || continue
     [ "$(cut -f2 "$state/siblings" | LC_ALL=C sort -u | wc -l | tr -d ' ')" = 2 ] || continue
     grep -q $'\t-\t' "$state/siblings" && continue
@@ -226,8 +303,7 @@ text_merges() {
     joined="$(sync_clock < "$state/siblings")"; elected="${joined%%:*}"
     [ "$elected" = "$rid" ] || continue
     first="$(head -1 "$state/siblings" | cut -f2)"; second="$(tail -1 "$state/siblings" | cut -f2)"
-    command -v diff3 >/dev/null || continue
-    if diff3 -m "$state/blobs/$first" "$state/base/$parent" "$state/blobs/$second" > "$state/merged"; then
+    if merge_run "$strategy" "$p" "$state/blobs/$first" "$state/base/$parent" "$state/blobs/$second" > "$state/merged" 2>/dev/null; then
       h="$(hash_file "$state/merged")"; mv "$state/merged" "$state/blobs/$h"
       vv="$(sync_clock "$rid" < "$state/siblings")"
       printf '%s\t%s\t%s\t%s\n' "$p" "$h" "$second" "$vv" > "$state/edit"
@@ -296,10 +372,11 @@ materialize() {
   retain_blobs
 }
 retain_blobs() {
-  local p h parent vv size
+  local p h parent vv size strategy
   : > "$state/base.keep"
+  merge_load
   while IFS=$'\t' read -r p h parent vv; do
-    is_text "$p" || continue
+    merge_strategy "$p"; merge_uses_base "$strategy" || continue
     for h in "$h" "$parent"; do
       [ "$h" != - ] || continue
       # Content-addressed: an existing base copy already holds these bytes.
