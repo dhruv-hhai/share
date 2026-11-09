@@ -179,8 +179,12 @@ share lease list                    # TSV, one live lease per line
 share lock <name> [--ttl 10m] [--wait 60s] -- <cmd>...
 ```
 
-- **Same host:** the `mkdir` lock with a `pid` file already used by the sync
-  loop (`tools/sync` `lock()`), on `.share/locks/<name>`. macOS has no `flock(1)`.
+- **Same host:** an exclusive `flock(1)` on `.share/locks/<name>` (util-linux on
+  Linux, the `flock` formula on macOS). The kernel releases it when the holder
+  exits or is killed, so there is no stale-lock breaking; `--ttl` is recorded,
+  not enforced. Ledger appends take the same kind of lock per writer chain.
+  `mkdir` locks are not used: concurrent `mkdir` was seen to succeed twice on one
+  Linux CI kernel.
 - **Across machines:** the lock is a lease on the name `lock:<name>`, granted
   by the **lock authority**, which is `--role a` unless configured otherwise.
   A non-authority replica asks the authority over the existing transport; if

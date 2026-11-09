@@ -62,7 +62,7 @@ ledger_verify > "$w/v"; [ ! -s "$w/v" ]
 wait
 [ "$(wc -l < "$state/ledger/r4/e.log")" -eq 40 ]
 ledger_verify > "$w/v"; [ ! -s "$w/v" ]
-[ ! -d "$state/ledger/r4/e.lock" ]
+flock -n "$state/ledger/r4/e.lock" true
 
 # Prefix extension replaces LOCAL; a stale peer keeps it; a divergent one is a fork file.
 local_f="$state/ledger/r3/c.log"
@@ -99,4 +99,15 @@ printf 'docs/*\tr2/b\t2000\t22\t%s\nlib/*\tr1/a\t1500\t11\t%s\n' "$cD" "$cL" > "
 cmp "$state/leases.idx" "$w/want"
 [ ! -e "$state/leases.idx.new" ]
 [ -n "$cA" ]
+
+# Racing claims on a live glob keep the first holder; an expired one is taken over.
+state="$w/race"; mkdir -p "$state"; now="$(date +%s)"
+r1="$(ledger_append r1/a lease-claim glob:src/* $((now + 600)) 11 600)"
+ledger_append r2/b lease-claim glob:src/* $((now + 1200)) 22 1200 >/dev/null
+r3="$(ledger_append r2/b lease-claim glob:old/* $((now - 5)) 22 1)"
+r4="$(ledger_append r1/a lease-claim glob:old/* $((now + 600)) 11 600)"
+project_leases
+printf 'old/*\tr1/a\t%s\t11\t%s\nsrc/*\tr1/a\t%s\t11\t%s\n' $((now + 600)) "$r4" $((now + 600)) "$r1" > "$w/want"
+cmp "$state/leases.idx" "$w/want"
+[ -n "$r3" ]
 echo 'ledger: ids, chains, verify, concurrent append, accept and lease projection passed'
