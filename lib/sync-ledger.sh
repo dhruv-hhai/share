@@ -25,23 +25,10 @@ ledger_hlc() {
   printf '%010d%06d\n' "$sec" "$cnt"
 }
 
-# mkdir lock as in tools/sync; a holder is only broken when its pid is gone.
-ledger_lock() {
-  local owner
-  until mkdir "$1" 2>/dev/null; do
-    owner="$(cat "$1/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -f "$1/pid"; rmdir "$1" 2>/dev/null || true
-    fi
-    sleep 0.2
-  done
-  printf '%s\n' "$$" > "$1/pid"
-}
-ledger_unlock() { rm -f "$1/pid"; rmdir "$1" 2>/dev/null || true; }
-
 # ledger_append WRITER KIND SUBJECT [DATA...]: prints the new entry's id.
-# Read prev, take hlc and append under one lock: concurrent appenders would
-# otherwise read the same prev and fork their own chain.
+# Read prev, take hlc and append under one flock: concurrent appenders would
+# otherwise read the same prev and fork their own chain. The kernel drops the
+# lock when the subshell exits, so a killed appender never leaves it held.
 ledger_append() {
   local f lk prev hlc rest id x writer kind subj
   [ $# -ge 3 ] && [ -n "$2" ] || return 1
@@ -50,12 +37,8 @@ ledger_append() {
   writer="$1"; kind="$2"; subj="$3"; shift 3
   mkdir -p "$(dirname "$f")"
   lk="${f%.log}.lock"
-  # Subshell-scoped traps: the lock is released on exit or signal and the
-  # caller's own traps are never touched.
   (
-    trap 'ledger_unlock "$lk"' EXIT
-    trap 'exit 1' INT TERM
-    ledger_lock "$lk"
+    flock 9 || exit 1
     prev=-
     if [ -s "$f" ]; then prev="$(tail -n 1 "$f" | cut -f1)"; fi
     hlc="$(ledger_hlc "$writer")"
@@ -64,7 +47,7 @@ ledger_append() {
     id="$(printf '%s' "$rest" | openssl dgst -sha256 | sed 's/.*= //')"
     printf '%s\t%s\n' "$id" "$rest" >> "$f"
     printf '%s\n' "$id"
-  )
+  ) 9> "$lk"
 }
 
 # Sorted union of all chains, optionally one kind. Ties on hlc break on writer.
@@ -134,14 +117,16 @@ ledger_accept() {
   log "ledger fork: ${dest##*/}"
 }
 
-# Derive $state/leases.idx from lease kinds: one live lease per glob, latest expires wins.
+# Derive $state/leases.idx from lease kinds: one live lease per glob. A claim takes a
+# glob only when it is free, already the claimer's, or expired by the claim's own hlc
+# second, so two writers racing for a live lease keep the first claim on every replica.
 project_leases() {
   local out="$state/leases.idx"
   ledger_lines | LC_ALL=C awk -F '\t' '
     $5 ~ /^lease-/ {
       g = substr($6, 6)
       if ($5 == "lease-claim") {
-        if (!live[g] || $7 + 0 > e[g] + 0) { live[g] = 1; w[g] = $4; e[g] = $7 + 0; p[g] = $8; c[g] = $1 }
+        if (!live[g] || w[g] == $4 || e[g] + 0 <= substr($3, 1, 10) + 0) { live[g] = 1; w[g] = $4; e[g] = $7 + 0; p[g] = $8; c[g] = $1 }
       } else if ($5 == "lease-renew") {
         if (live[g] && w[g] == $4 && $7 + 0 > e[g] + 0) e[g] = $7 + 0
       } else if ($5 == "lease-release" || $5 == "lease-lost") {

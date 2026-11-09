@@ -109,6 +109,10 @@ jobs:
 
             depends_on "croc"
 
+            on_macos do
+              depends_on "flock"
+            end
+
             def install
               libexec.install "share", "tools", "lib"
               bin.install_symlink libexec/"share"

@@ -140,6 +140,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: flock(1) on macOS (share lock and ledger appends)
+        if: runner.os == 'macOS'
+        run: brew install flock
       - name: Algebra and filesystem safety
         run: |
           /bin/bash test/sync-merge

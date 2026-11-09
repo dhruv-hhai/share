@@ -37,29 +37,9 @@ rid="$(cat "$state/replica")"
 writer="$rid/$name"
 now="$(date +%s)"
 
-# replaced by ledger_append from lib/sync-ledger.sh at integration
-# One Contracts-B line: id prev hlc writer kind subject data...; prints its id.
-lease_ledger_append() {
-  local writer_id="$1" kind="$2" subject="$3" rid_part name_part file prev last lh ls lc sec cnt hlc line id x
-  shift 3
-  rid_part="${writer_id%%/*}"; name_part="${writer_id#*/}"
-  file="$state/ledger/$rid_part/$name_part.log"
-  mkdir -p "$state/ledger/$rid_part"
-  prev=-; last=""
-  if [ -f "$file" ]; then last="$(tail -n 1 "$file")"; [ -z "$last" ] || prev="${last%%"$tab"*}"; fi
-  # hlc: unix seconds + per-writer counter; never moves backwards within a chain
-  sec="$now"; cnt=0
-  if [ -n "$last" ]; then
-    lh="$(printf '%s' "$last" | cut -f3)"; ls="$((10#${lh:0:10}))"; lc="$((10#${lh:10:6}))"
-    if [ "$ls" -ge "$now" ]; then sec="$ls"; cnt="$((lc + 1))"; fi
-  fi
-  hlc="$(printf '%010d%06d' "$sec" "$cnt")"
-  line="$prev$tab$hlc$tab$writer_id$tab$kind$tab$subject"
-  for x in "$@"; do line="$line$tab$x"; done
-  id="$(printf '%s' "$line" | openssl dgst -sha256 | sed 's/.*= //')"
-  printf '%s\n' "$id$tab$line" >> "$file"
-  printf '%s\n' "$id"
-}
+sync_lib="$(cd "$(dirname "$0")/../lib" && pwd)"
+# shellcheck source=../lib/sync-ledger.sh
+. "$sync_lib/sync-ledger.sh"
 
 # Projection: latest claim/renew/release per (writer, glob) in hlc order.
 lease_rebuild() {
@@ -127,7 +107,7 @@ cmd_claim() {
   done
   [ "$rc" = 0 ] || exit 3
   expires=$((now + secs))
-  for g in "${args[@]}"; do lease_ledger_append "$writer" lease-claim "glob:$g" "$expires" "$pid" "$secs" >/dev/null; done
+  for g in "${args[@]}"; do ledger_append "$writer" lease-claim "glob:$g" "$expires" "$pid" "$secs" >/dev/null; done
   lease_rebuild
 }
 
@@ -137,7 +117,7 @@ cmd_renew() {
   { awk -F '\t' -v w="$writer" '$2 == w {print $1 "\t" $4 "\t" $5}' "$state/leases.idx" 2>/dev/null || :; } | while IFS="$tab" read -r g p c; do
     kill -0 "$p" 2>/dev/null || continue
     secs="$(ttl_of "$c")"; [ -n "$secs" ] || continue
-    lease_ledger_append "$writer" lease-renew "glob:$g" "$((now + secs))" >/dev/null
+    ledger_append "$writer" lease-renew "glob:$g" "$((now + secs))" >/dev/null
   done
   lease_rebuild
 }
@@ -149,7 +129,7 @@ cmd_release() {
   printf '%s\n' "$list" | while IFS= read -r g; do
     [ -n "$g" ] || continue
     printf '%s\n' "$own" | grep -Fxq -- "$g" || continue
-    lease_ledger_append "$writer" lease-release "glob:$g" - >/dev/null
+    ledger_append "$writer" lease-release "glob:$g" - >/dev/null
   done
   lease_rebuild
 }
