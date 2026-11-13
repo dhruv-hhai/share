@@ -15,7 +15,14 @@ d="${d:-${SHARE_PULL_DIR:-$HOME/share}/$f}"; mkdir -p "$d"; cd "$d"
 waited=""
 so="$(mktemp)"; se="$(mktemp)"
 cleanup() { rm -f "$so" "$se"; [ -z "${pid:-}" ] || kill "$pid" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Match push's fallback even when this peer can reach the original relay.
+# Explicit pins remain on that relay; both peers must use the same pin.
+relay="${SHARE_RELAY:-${CROC_RELAY:-}}"; fallback="croc.schollz.com:9009"
+switch_after="${SHARE_RELAY_WAIT:-60}"; t0="$(date +%s)"
 
 while :; do
   CROC_SECRET="$(code -f "$f" ${s:+--salt "$s"})"; export CROC_SECRET
@@ -25,10 +32,16 @@ while :; do
 
   : > "$so"; : > "$se"
   # stdout carries croc fatal errors; stderr carries progress — shown live AND watched
-  croc --yes --overwrite > "$so" 2> >(tee "$se" >&2) & pid=$!
+  args=(--yes --overwrite); [ -z "$relay" ] || args+=(--relay "$relay")
+  exec 3> >(tee "$se" >&2); tee_pid=$!
+  croc "${args[@]}" > "$so" 2>&3 & pid=$!
 
   idle=""
   while kill -0 "$pid" 2>/dev/null; do
+    if [ -z "$relay" ] && [ $(( $(date +%s) - t0 )) -ge "$switch_after" ] && ! grep -qE 'Receiving|%' "$se" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+      relay="$fallback"; idle=1; break
+    fi
     if grep -q 'waiting for sender' "$se" 2>/dev/null; then
       # admitted but no sender — grace period, then tear down rather than hold the room
       sleep 3
@@ -39,9 +52,14 @@ while :; do
     fi
     sleep 0.3
   done
+  exec 3>&-; wait "$tee_pid" || true
   if [ -z "$idle" ]; then
     if wait "$pid"; then pid=""; [ -s "$so" ] && cat "$so"; exit 0; fi
     pid=""
+    if [ -z "$relay" ] && grep -qE 'could not connect to .*: i/o timeout' "$so" "$se"; then
+      relay="$fallback"; printf 'share: relay unavailable; retrying via %s\n' "$relay" >&2
+      continue
+    fi
     grep -q 'relay admission rejected' "$so" || { [ -s "$so" ] && cat "$so" >&2; exit 1; }
   fi
   pid=""
