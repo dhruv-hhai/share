@@ -4,6 +4,34 @@
 #   STUB_CONNECT_AFTER  seconds before the peer "connects" (default 1)
 #   STUB_DURATION       seconds of progress for transfer mode (default 20)
 [ "${1:-}" = --version ] && { echo "croc stub"; exit 0; }
+if [ "${STUB_MODE:-}" = relay ]; then
+  direction=pull; case " $* " in *" send "*) direction=push;; esac
+  printf '%s %s\n' "$direction" "$*" >> "$STUB_RELAY_LOG"
+  relay=""; while [ $# -gt 0 ]; do case "$1" in --relay) relay="$2"; shift;; esac; shift; done
+  if [ -n "$relay" ]; then
+    [ "$relay" = "${STUB_EXPECT_RELAY:-croc.schollz.com:9009}" ] || exit 2
+    [ "${STUB_PIN_FAIL:-0}" != 1 ] || { echo 'could not connect to pinned: i/o timeout'; exit 1; }
+    # A common room verifies that the waiting peer follows the unreachable one.
+    if [ -n "${STUB_RELAY_ROOM:-}" ]; then
+      touch "$STUB_RELAY_ROOM/$direction"
+      while [ ! -f "$STUB_RELAY_ROOM/push" ] || [ ! -f "$STUB_RELAY_ROOM/pull" ]; do sleep 0.1; done
+    fi
+    exit 0
+  fi
+  if [ "${STUB_RELAY_WAITING:-}" = "$direction" ]; then
+    while :; do sleep 0.1; done
+  fi
+  if [ "${STUB_RELAY_STDERR:-0}" = 1 ]; then
+    echo "${STUB_RELAY_ERROR:-could not connect to relay.example:9009: dial tcp: i/o timeout}" >&2
+  else echo "${STUB_RELAY_ERROR:-could not connect to relay.example:9009: dial tcp: i/o timeout}"; fi
+  exit 1
+fi
+if [ "${STUB_MODE:-}" = pullfail ]; then
+  case " $* " in
+    *" send "*) while :; do sleep 1; done;;
+    *) [ -f "$TMPDIR/pull-recovered" ] && exit 0; echo 'relay unavailable'; exit 1;;
+  esac
+fi
 if [ "${STUB_MODE:-}" = queue ]; then
   room="$STUB_QUEUE/$CROC_SECRET"; mkdir -p "$room"
   case " $* " in

@@ -20,8 +20,87 @@ trap 'stop' EXIT
 
 echo "sync watchdog (stub croc)"
 
+# Health must report undelivered work even when both loops keep retrying.
+start wait
+until_ok 10 test -s "$W/d/.share/manifest" || fail "initial manifest"
+now="$(date +%s)"
+echo "$now" > "$W/d/.share/peer/bob.time"
+S check --friend bob >/dev/null || fail "fresh pending push should be healthy"
+echo $((now - 901)) > "$W/d/.share/peer/bob.time"
+if S check --friend bob > "$W/health"; then fail "stale pending push must exit nonzero"; fi
+grep -q 'stuck .*pending delivery overdue' "$W/health" || fail "stale pending push verdict"
+pass "pending changes with last push older than 15m are stuck"
+cp "$W/d/.share/manifest" "$W/d/.share/peer/bob.pushed"
+S check --friend bob >/dev/null || fail "old push without pending changes should be healthy"
+pass "old push without pending changes stays healthy"
+rm "$W/d/.share/peer/bob.pushed" "$W/d/.share/peer/bob.time"
+echo $((now - 901)) > "$W/t/share-sync-bob.started"
+if S check --friend bob >/dev/null; then fail "never-delivered changes must become stuck"; fi
+pass "first push gets a bounded grace period too"
+stop
+
+start pullfail
+until_ok 10 test -s "$W/t/share-sync-bob.pullfail" || fail "pull failure marker"
+first="$(cat "$W/t/share-sync-bob.pullfail")"
+sleep 2
+[ "$(cat "$W/t/share-sync-bob.pullfail")" = "$first" ] || fail "retries reset the failure streak"
+S check --friend bob | grep -q 'pull failing for' || fail "fresh pull failure detail"
+echo $(( $(date +%s) - 901 )) > "$W/t/share-sync-bob.pullfail"
+if S check --friend bob > "$W/health"; then fail "old pull failure must exit nonzero"; fi
+grep -q 'stuck .*pull failing for 15m' "$W/health" || fail "old pull failure verdict"
+pass "pull failure streak is recorded once, visible, and stuck after 15m"
+touch "$W/t/pull-recovered"
+until_ok 10 test ! -f "$W/t/share-sync-bob.pullfail" || fail "pull recovery clears marker"
+S check --friend bob >/dev/null || fail "health recovers after pull success"
+pass "successful pull clears failure streak and recovers health"
+stop
+
+# Both directions must meet at the fallback when only one cannot connect.
+# Exercise the real push/pull wrappers; the stub distinguishes relay arguments.
+W="$(mktemp -d)"; mkdir -p "$W"/{d,t,cfg,room}; echo payload > "$W/d/hi.md"
+export TMPDIR="$W/t" STUB_MODE=relay STUB_RELAY_LOG="$W/relays" SHARE_RELAY_WAIT=1
+unset SHARE_RELAY CROC_RELAY
+transport_pair() {
+  rm -f "$W/room/push" "$W/room/pull"
+  STUB_RELAY_ROOM="$W/room" "$share" push --friend bob "$W/d/hi.md" > "$W/pushlog" 2>&1 & sender=$!
+  STUB_RELAY_ROOM="$W/room" "$share" pull --friend bob --dest "$W/d" --quiet > "$W/pulllog" 2>&1 & receiver=$!
+  until_ok 25 test -f "$W/room/push" && until_ok 25 test -f "$W/room/pull" || { kill "$sender" "$receiver" 2>/dev/null; fail "peers failed to meet at fallback"; }
+  wait "$sender" && wait "$receiver" || fail "fallback transfer failed"
+}
+export STUB_RELAY_WAITING=push
+transport_pair
+pass "reachable sender follows timed-out receiver to the same fallback"
+export STUB_RELAY_WAITING=pull STUB_RELAY_STDERR=1
+transport_pair
+pass "reachable receiver follows timed-out sender to the same fallback"
+unset STUB_RELAY_WAITING
+: > "$W/relays"
+export STUB_RELAY_ERROR='could not secure channel'
+if "$share" push --friend bob "$W/d/hi.md" >/dev/null 2>&1; then fail "unrelated push error hidden"; fi
+if "$share" pull --friend bob --dest "$W/d" --quiet >/dev/null 2>&1; then fail "unrelated pull error hidden"; fi
+[ "$(wc -l < "$W/relays")" -eq 2 ] || fail "unrelated errors must not trigger fallback"
+pass "unrelated croc errors fail without fallback"
+unset STUB_RELAY_ERROR STUB_RELAY_STDERR
+: > "$W/relays"
+export SHARE_RELAY=private.example:9009 CROC_RELAY=ignored.example:9009 STUB_EXPECT_RELAY=private.example:9009
+"$share" push --friend bob "$W/d/hi.md" >/dev/null 2>&1 || fail "SHARE_RELAY push pin"
+"$share" pull --friend bob --dest "$W/d" --quiet >/dev/null 2>&1 || fail "SHARE_RELAY pull pin"
+[ "$(wc -l < "$W/relays")" -eq 2 ] || fail "explicit pin retried unexpectedly"
+grep -q 'push .*--relay private.example:9009' "$W/relays" && grep -q 'pull .*--relay private.example:9009' "$W/relays" || fail "pin precedence"
+unset SHARE_RELAY
+export STUB_EXPECT_RELAY="$CROC_RELAY"
+"$share" push --friend bob "$W/d/hi.md" >/dev/null 2>&1 || fail "CROC_RELAY push pin"
+"$share" pull --friend bob --dest "$W/d" --quiet >/dev/null 2>&1 || fail "CROC_RELAY pull pin"
+pass "both wrappers honor SHARE_RELAY then CROC_RELAY"
+export STUB_PIN_FAIL=1
+if "$share" push --friend bob "$W/d/hi.md" >/dev/null 2>&1; then fail "pinned push error hidden"; fi
+if "$share" pull --friend bob --dest "$W/d" --quiet >/dev/null 2>&1; then fail "pinned pull error hidden"; fi
+pass "unreachable explicit pins fail without switching relays"
+unset TMPDIR STUB_MODE STUB_RELAY_LOG SHARE_RELAY_WAIT CROC_RELAY STUB_EXPECT_RELAY STUB_PIN_FAIL
+rm -rf "$W"
+
 # 1. a 20s transfer under a 4s waiting cap: must complete in one go
-start transfer SHARE_PUSH_MAX=4 STUB_DURATION=20
+start transfer SHARE_PUSH_MAX=4 SHARE_RELAY_WAIT=2 STUB_DURATION=20
 until_ok 10 sh -c "TMPDIR='$W/t' XDG_CONFIG_HOME='$W/cfg' '$share' sync status | grep -q ' sending .*push sending for'" || fail "sending verdict during a transfer: $(S status)"
 pass "verdict 'sending' while bytes move"
 until_ok 15 test -f "$W/t/share-sync-bob.pushlog" || fail "push log exists while a push is open"

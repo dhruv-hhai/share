@@ -21,6 +21,23 @@ cron: `*/5 * * * * share sync check --repair` (ensure share and croc are on PATH
 
 ## Health
 
+Pending changes are `stuck` when the last successful push is more than 15 minutes
+old. A folder that has never pushed gets the same grace period from daemon start.
+Hard pull failures retain their first-failure time across retries and restarts:
+details show `pull failing for Xm`, and become `stuck` after 15 minutes. A
+successful pull clears that streak. Set `SHARE_SYNC_STUCK_AFTER` to adjust both
+health thresholds independently of the waiting-room and transfer watchdog caps.
+
+Without a relay pin, push and pull first use croc's normal relay selection. A
+connection timeout retries at `croc.schollz.com:9009`. Both sides also switch to
+that relay after 60 seconds without connecting, so a peer that can reach the
+original relay follows one that cannot. Transfers already showing progress are
+left alone. Set the same `SHARE_RELAY` (preferred) or `CROC_RELAY` on both peers
+to pin a relay and disable automatic switching, including for private relays.
+An older peer can still connect during the initial normal-relay window. Recovery
+through automatic fallback requires both peers to upgrade, or both to pin the
+same reachable relay (`CROC_RELAY` also works with older peers).
+
 Verdicts are `ok`, `waiting-peer` (a push is open at the relay until they come online — normal), `sending` (they connected and the transfer is moving), `stuck` (heartbeat stopped, stale lock, a waiting push far past its cap, or a transfer with no progress — restart it), `down` (configured but not running). The daemon's own watchdog fixes what it can in place: respawns a dead loop, reopens a push still *waiting* longer than `SHARE_PUSH_MAX` seconds (default 7200 — relays drop unclaimed rooms after ~3h) or one opened before the UTC-midnight code rotation, reopens a *transfer* only when it shows no progress for `SHARE_PUSH_STALL` seconds (default 900 — a big folder on a slow link is never cut off just for taking long), reconnects after a sleep/wake clock jump, breaks a lock held over 10 minutes, and versions your edits on its own tick so a blocked push never holds them hostage. Every reset is a log line.
 
 ## Versions, conflicts and storage
@@ -102,6 +119,9 @@ it does not restore old content. Keep ordinary backups.
 | `SHARE_SYNC_HEARTBEAT` | `180` | Seconds between unchanged-state retries |
 | `SHARE_PUSH_MAX` | `7200` | Waiting-peer cap, seconds |
 | `SHARE_PUSH_STALL` | `900` | Transfer no-progress cap, seconds |
+| `SHARE_SYNC_STUCK_AFTER` | `900` | Pending-push and hard pull-failure health cap, seconds |
+| `SHARE_RELAY` | unset | Pin a relay on both peers; overrides `CROC_RELAY` |
+| `SHARE_RELAY_WAIT` | `60` | Pre-transfer wait before automatic fallback, seconds (without a pin) |
 | `SHARE_DISK_RESERVE_MB` | `1024` | Free-space reserve |
 | `SHARE_BIG_MB` | `20` | Large-file warning threshold |
 | `SHARE_PULL_DIR` | `~/share` | Default parent of friend folders |

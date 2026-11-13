@@ -49,6 +49,7 @@ tmp="${TMPDIR:-/tmp}"
 cfgd="${XDG_CONFIG_HOME:-$HOME/.config}/share/sync"   # one file per friend: "ROLE EVERY DIR" — survives reboot + $TMPDIR purge
 pmax="${SHARE_PUSH_MAX:-7200}"                        # reopen a push waiting longer than this (relay drops unclaimed rooms ~3h)
 pstall="${SHARE_PUSH_STALL:-900}"                     # once bytes flow, reopen only if croc shows no progress for this long
+hmax="${SHARE_SYNC_STUCK_AFTER:-900}"                 # pending delivery / hard pull failure health cap
 
 # Daemons found by process scan, one line per daemon: "PGID FRIEND ROLE". The pid
 # file is the primary record, but macOS purges $TMPDIR files untouched for ~3 days
@@ -94,6 +95,11 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
       fi
     fi
     v="${v:-ok}"
+    if [ -f "$tmp/share-sync-$f.pullfail" ]; then
+      read -r age < "$tmp/share-sync-$f.pullfail"; age=$((now - age))
+      d="$d, pull failing for $(ago "$age")"
+      [ "$age" -le "$hmax" ] || v=stuck
+    fi
   fi
   if [ -f "$dir/.share/manifest" ]; then local pending siblings tombstones
     if [ -f "$dir/.share/peer/$f.pushed" ]; then
@@ -102,6 +108,12 @@ health() { local f="$1" v="" d now age pf; now="$(date +%s)"; info "$f"; pf="$tm
     siblings="$(cut -f1 "$dir/.share/manifest" | sort | uniq -d | wc -l | tr -d ' ')"
     tombstones="$(awk -F '\t' '$2=="-"{n++}END{print n+0}' "$dir/.share/manifest")"
     d="$d, pending $pending, siblings $siblings, tombstones $tombstones"
+    if [ "$pending" -gt 0 ] && [ "$v" != down ]; then
+      local lastpush
+      lastpush="$(cat "$dir/.share/peer/$f.time" 2>/dev/null || cat "$tmp/share-sync-$f.started" 2>/dev/null || echo 0)"
+      age=$((now - lastpush))
+      if [ "$age" -gt "$hmax" ]; then v=stuck; d="$d, pending delivery overdue (last push $(ago "$age") ago)"; fi
+    fi
     local dpct dfree; read -r dpct dfree < <(df -Pk "$dir" 2>/dev/null | awk 'NR==2{sub("%","",$5); print $5, int($4/1024)}')
     # loud only on free space (what the fence uses): APFS reports purgeable space as used, so a percentage alone misleads
     if [ "${dfree:-999999}" -lt "${SHARE_DISK_RESERVE_MB:-1024}" ]; then d="$d, DISK LOW ${dfree}MB free (${dpct}% used)"
@@ -206,6 +218,7 @@ fi
 # --- CRDT engine (foreground) ---
 if [ "$role" = a ]; then out="sync-a2b"; in_="sync-b2a"; else out="sync-b2a"; in_="sync-a2b"; fi
 printf '%s %s %s %s\n' "$$" "$role" "$d" "$lg" > "$pidf"
+date +%s > "$tmp/share-sync-$f.started"
 stage="$tmp/share-sync-$f-in"; mkdir -p "$stage"
 lk="$tmp/share-sync-$f.gitlock"   # mkdir-lock serializes the loops on one repo
 pushf="$tmp/share-sync-$f.push"   # "EPOCH HEAD UTCDAY" while a push is open at the relay — what status/watchdog read
@@ -283,6 +296,7 @@ puller() {
     rm -rf "$stage"; mkdir -p "$stage"
     bash -c 'pull "$@"; exit $?' _ --friend "$f" --salt "$in_" --dest "$stage" --quiet >/dev/null 2>&1 &
     if wait "$!"; then
+      rm -f "$tmp/share-sync-$f.pullfail"
       [ -z "$pfail" ] || { log "pull recovered"; pfail=""; }
       bundle="$stage/share-sync-v2.tar"
       if [ ! -f "$bundle" ]; then
@@ -300,6 +314,7 @@ puller() {
 
       unlock
     else
+      [ -f "$tmp/share-sync-$f.pullfail" ] || date +%s > "$tmp/share-sync-$f.pullfail"
       # pull fails hard only when croc itself fails (relay unreachable, bad binary) — say so once, not every tick
       [ -n "$pfail" ] || { log "pull failed — retrying every ${every}s, quietly (relay unreachable? peer mid-restart?)"; pfail=1; }
       sleep "$every"
